@@ -1,0 +1,5 @@
+# Emergency stop. Pre-empts the active PickPlace action and halts controllers.
+string cmd_id
+---
+bool   success
+string message

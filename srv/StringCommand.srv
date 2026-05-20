@@ -1,0 +1,5 @@
+# Generic JSON envelope used by openarm_api as the single ROS2 entry point
+# for upper-computer / LLM clients.  Both fields are JSON encoded as strings.
+string request_json
+---
+string response_json

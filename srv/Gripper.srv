@@ -1,0 +1,9 @@
+# Open / close the chosen gripper.
+string  arm        # "left" | "right"
+string  action     # "open" | "close" | "half_close"
+float64 position   # Optional explicit finger position in metres (>0 overrides action)
+float64 force      # Reserved (ignored by simple position controllers)
+---
+bool   success
+int32  result_code
+string message

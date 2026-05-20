@@ -1,0 +1,12 @@
+# Ask the perception node to compute a 6-DoF pose for either the object to
+# be grasped or the place region. Result is in the robot base frame.
+string mode           # "grasp" | "place"
+string target_name
+int32  target_index
+---
+bool   success
+int32  result_code
+geometry_msgs/Pose pose
+float64 confidence    # 0.0 ~ 1.0
+string  frame_id
+string  message

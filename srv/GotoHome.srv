@@ -1,0 +1,7 @@
+# Drive arm(s) back to the SRDF "home" group state.
+string  arm           # "left" | "right" | "both"
+float64 speed_scale   # 0.0 ~ 1.0 (0 -> server default)
+---
+bool   success
+int32  result_code
+string message

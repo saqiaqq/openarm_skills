@@ -1,0 +1,30 @@
+# PickPlace.action
+# Goal: drive the chosen arm through a full pick -> transport -> place cycle.
+# All poses are expressed in the robot base frame (typically `base_link`).
+#
+# Goal --------------------------------------------------------------
+string  cmd_id              # Caller-provided idempotency id (uuid)
+string  arm                 # "left" | "right"
+string  pose_source         # "camera" | "upper_computer"
+string  target_name         # Object label when pose_source == camera (e.g. "cup")
+int32   target_index        # Optional disambiguation when several targets are detected
+geometry_msgs/Pose grasp_pose   # Used when pose_source == upper_computer (else ignored)
+geometry_msgs/Pose place_pose   # Used when pose_source == upper_computer (else ignored)
+float64 approach_offset_m   # Pre-grasp / pre-place stand-off height (default 0.05)
+float64 retreat_offset_m    # Lift height after grasp / release (default 0.05)
+float64 speed_scale         # Velocity scaling for the slow phases (0.0 ~ 1.0)
+float64 timeout_s           # 0 = use server default
+---
+# Result ------------------------------------------------------------
+bool    success
+int32   result_code         # See openarm_api/schemas/error_codes.json
+string  status              # "done" | "error" | "stopped"
+string  message
+geometry_msgs/Pose perceived_grasp_pose   # Filled when pose_source == camera
+geometry_msgs/Pose perceived_place_pose   # Filled when pose_source == camera
+---
+# Feedback ----------------------------------------------------------
+string  status              # idle|perceiving|grasping|transporting|placing|done|error|stopped
+string  phase               # Fine-grained tag, e.g. "pick.approach", "place.descend"
+float32 progress            # 0.0 ~ 1.0
+string  message
