@@ -20,21 +20,43 @@ The same package also defines the generic JSON envelope srv used by
 ## Quick start
 
 ```bash
-# 1. start MoveIt + controllers + RViz (terminal A)
-ros2 launch openarm_bimanual_moveit_config demo.launch.py
-
-# 2. start the skill server (terminal B)
+# One-shot: demo (MoveIt + controllers + RViz) + skill_server (default)
 ros2 launch openarm_skills skills.launch.py
 
-# 3. (optional) start the perception stub if you want pose_source=camera
+# Headless / no RViz
+ros2 launch openarm_skills skills.launch.py use_rviz:=false
+
+# Skills only (demo already running in another terminal)
+ros2 launch openarm_skills skills.launch.py use_demo:=false
+
+# (optional) perception stub for pose_source=camera
 ros2 launch openarm_perception perception.launch.py
 
+# Automated smoke tests (after stack is up)
+bash src/openarm_skills/scripts/test_openarm_skills.sh ~/code/openArm
+```
+
+## Interface test cheat sheet
+
+| # | Interface | Type | Test command |
+|---|-----------|------|----------------|
+| 1 | `/openarm/gripper` | Service | `ros2 service call /openarm/gripper openarm_skills/srv/Gripper "{arm: 'left', action: 'open', position: 0.0, force: 0.0}"` |
+| 2 | `/openarm/gripper` | Service | `action: 'half_close'` — same as above, change action |
+| 3 | `/openarm/gripper` | Service | `action: 'close'` |
+| 4 | `/openarm/gripper` | Service | `action: 'grasp'` — compliant close / hold (needs object for full test) |
+| 5 | `/openarm/goto_home` | Service | `ros2 service call /openarm/goto_home openarm_skills/srv/GotoHome "{arm: 'both', speed_scale: 0.15}"` |
+| 6 | `/openarm/stop` | Service | `ros2 service call /openarm/stop openarm_skills/srv/Stop "{cmd_id: 'stop-1'}"` |
+| 7 | `/openarm/pick_place` | Action | see § Quick start item 4 below |
+| 8 | `/openarm/detect_grasp_pose` | Client (in skill_server) | start `openarm_perception`; use `pose_source: camera` in pick_place |
+
+```bash
 # 4. drive a pick & place from the CLI (upper_computer mode)
+# Poses are in the `world` frame (see skills.yaml base_frame). Adjust x/y/z for your cell.
 ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace "{
   cmd_id: 'cli-1', arm: 'right', pose_source: 'upper_computer',
-  grasp_pose: {position: {x: 0.42, y: 0.10, z: 0.20},
+  grasp_pose: {position: {x: 0.42, y: -0.10, z: 0.20},
                orientation: {x: 0, y: 0.7071, z: 0, w: 0.7071}},
-  place_pose: {position: {x: 0.30, y: -0.20, z: 0.20},
+  place_pose: {position: {x: 0.30, y: -0.30, z: 0.20},
                orientation: {x: 0, y: 0.7071, z: 0, w: 0.7071}},
   approach_offset_m: 0.05, retreat_offset_m: 0.05,
   speed_scale: 0.10, timeout_s: 30.0

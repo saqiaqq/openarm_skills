@@ -1,6 +1,6 @@
-# Open / close the chosen gripper.
+# Open / close / grasp the chosen gripper.
 string  arm        # "left" | "right"
-string  action     # "open" | "close" | "half_close"
+string  action     # "open" | "close" | "half_close" | "grasp"
 float64 position   # Optional explicit finger position in metres (>0 overrides action)
 float64 force      # Reserved (ignored by simple position controllers)
 ---

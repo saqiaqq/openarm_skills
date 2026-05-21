@@ -44,6 +44,8 @@ namespace openarm_skills
 using PickPlaceAction = openarm_skills::action::PickPlace;
 using PickPlaceGoalHandle = rclcpp_action::ServerGoalHandle<PickPlaceAction>;
 using moveit::planning_interface::MoveGroupInterface;
+// Humble 版 MoveIt2 的 MoveGroupInterface 没有 SharedPtr typedef，手动补充
+using MoveGroupInterfacePtr = std::shared_ptr<MoveGroupInterface>;
 
 class SkillServerNode : public rclcpp::Node
 {
@@ -64,7 +66,11 @@ public:
     right_arm_group_        = get("right_arm_group",  std::string("right_arm"));
     left_grip_group_        = get("left_gripper_group",  std::string("left_gripper"));
     right_grip_group_       = get("right_gripper_group", std::string("right_gripper"));
-    base_frame_             = get("base_frame",       std::string("base_link"));
+    base_frame_             = get("base_frame",       std::string("world"));
+    left_eef_link_          = get("left_eef_link",    std::string("openarm_left_hand_tcp"));
+    right_eef_link_         = get("right_eef_link",   std::string("openarm_right_hand_tcp"));
+    goal_pos_tol_           = get("goal_position_tolerance_m", 0.01);
+    goal_ori_tol_           = get("goal_orientation_tolerance_rad", 0.1);
 
     default_speed_scale_    = get("default_speed_scale",   0.10);
     transport_speed_scale_  = get("transport_speed_scale", 0.30);
@@ -74,11 +80,12 @@ public:
     approach_offset_m_      = get("approach_offset_m", 0.05);
     retreat_offset_m_       = get("retreat_offset_m",  0.05);
     step_timeout_s_         = get("step_timeout_s",    10.0);
+    planning_time_s_        = get("planning_time_s",   15.0);
     plan_retry_count_       = get("plan_retry_count",  2);
     grasp_retry_count_      = get("grasp_retry_count", 1);
 
-    gripper_open_pos_       = get("gripper_open_pos",   0.044);
-    gripper_half_pos_       = get("gripper_half_pos",   0.022);
+    gripper_open_pos_       = get("gripper_open_pos",   0.040);
+    gripper_half_pos_       = get("gripper_half_pos",   0.020);
     gripper_closed_pos_     = get("gripper_closed_pos", 0.0);
     gripper_close_thresh_   = get("gripper_close_threshold_m", 0.001);
 
@@ -133,11 +140,54 @@ public:
     left_grip_  = std::make_shared<MoveGroupInterface>(mg_node_, left_grip_group_);
     right_grip_ = std::make_shared<MoveGroupInterface>(mg_node_, right_grip_group_);
 
-    for (auto * mg : {left_arm_.get(), right_arm_.get()}) {
-      mg->setPoseReferenceFrame(base_frame_);
-      mg->setMaxVelocityScalingFactor(default_speed_scale_);
-      mg->setMaxAccelerationScalingFactor(default_speed_scale_);
+    configureArmMoveGroup(left_arm_, left_eef_link_, "left");
+    configureArmMoveGroup(right_arm_, right_eef_link_, "right");
+
+    RCLCPP_INFO(get_logger(),
+                "MoveGroup frame='%s' EEF: left=%s right=%s (planning_time=%.1fs)",
+                base_frame_.c_str(), left_eef_link_.c_str(), right_eef_link_.c_str(),
+                planning_time_s_);
+  }
+
+  void configureArmMoveGroup(MoveGroupInterfacePtr arm,
+                              const std::string & eef_link,
+                              const std::string & label)
+  {
+    arm->setEndEffectorLink(eef_link);
+    arm->setPoseReferenceFrame(base_frame_);
+    arm->setPlanningTime(planning_time_s_);
+    arm->setNumPlanningAttempts(5);
+    arm->setGoalPositionTolerance(goal_pos_tol_);
+    arm->setGoalOrientationTolerance(goal_ori_tol_);
+    arm->setMaxVelocityScalingFactor(default_speed_scale_);
+    arm->setMaxAccelerationScalingFactor(default_speed_scale_);
+    logCurrentEef(arm, label);
+  }
+
+  void logCurrentEef(MoveGroupInterfacePtr arm, const std::string & label) const
+  {
+    try {
+      const auto pose = arm->getCurrentPose(arm->getEndEffectorLink());
+      const auto & p = pose.pose.position;
+      RCLCPP_INFO(get_logger(),
+                  "[%s] current TCP in '%s': x=%.3f y=%.3f z=%.3f (use RViz to tune goals)",
+                  label.c_str(), arm->getPlanningFrame().c_str(), p.x, p.y, p.z);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(get_logger(), "[%s] cannot read current TCP: %s",
+                  label.c_str(), e.what());
     }
+  }
+
+  static void logTargetPose(rclcpp::Logger logger,
+                            const std::string & phase,
+                            const geometry_msgs::msg::Pose & p)
+  {
+    RCLCPP_ERROR(logger,
+                 "[%s] target in planning frame: pos [%.3f, %.3f, %.3f] "
+                 "ori [%.3f, %.3f, %.3f, %.3f] — check reachability / y sign "
+                 "(right arm y<0, left arm y>0)",
+                 phase.c_str(), p.position.x, p.position.y, p.position.z,
+                 p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w);
   }
 
   rclcpp::Node::SharedPtr mgNode() { return mg_node_; }
@@ -146,13 +196,13 @@ private:
   // ===========================================================================
   // Helpers
   // ===========================================================================
-  MoveGroupInterface::SharedPtr armGroup(const std::string & arm) const
+  MoveGroupInterfacePtr armGroup(const std::string & arm) const
   {
     if (arm == "left")  return left_arm_;
     if (arm == "right") return right_arm_;
     return nullptr;
   }
-  MoveGroupInterface::SharedPtr gripGroup(const std::string & arm) const
+  MoveGroupInterfacePtr gripGroup(const std::string & arm) const
   {
     if (arm == "left")  return left_grip_;
     if (arm == "right") return right_grip_;
@@ -169,7 +219,7 @@ private:
   }
 
   // Cartesian linear motion. Returns err::OK on success.
-  int linearMoveTo(MoveGroupInterface::SharedPtr arm,
+  int linearMoveTo(MoveGroupInterfacePtr arm,
                    const geometry_msgs::msg::Pose & target,
                    double speed_scale,
                    const std::string & phase)
@@ -179,6 +229,7 @@ private:
 
     arm->setMaxVelocityScalingFactor(speed_scale);
     arm->setMaxAccelerationScalingFactor(speed_scale);
+    arm->setPlanningTime(planning_time_s_);
 
     std::vector<geometry_msgs::msg::Pose> waypoints{target};
     moveit_msgs::msg::RobotTrajectory traj;
@@ -208,7 +259,7 @@ private:
 
   // Joint-space motion to a pose (used for the longer transport segment where
   // a straight Cartesian line is unnecessary and may be infeasible).
-  int jointMoveTo(MoveGroupInterface::SharedPtr arm,
+  int jointMoveTo(MoveGroupInterfacePtr arm,
                   const geometry_msgs::msg::Pose & target,
                   double speed_scale,
                   const std::string & phase)
@@ -218,7 +269,15 @@ private:
 
     arm->setMaxVelocityScalingFactor(speed_scale);
     arm->setMaxAccelerationScalingFactor(speed_scale);
-    arm->setPoseTarget(target);
+    arm->setPlanningTime(planning_time_s_);
+    arm->setStartStateToCurrentState();
+
+    const std::string eef = arm->getEndEffectorLink();
+    if (!arm->setPoseTarget(target, eef)) {
+      RCLCPP_ERROR(get_logger(), "[%s] IK failed for link '%s'", phase.c_str(), eef.c_str());
+      logTargetPose(get_logger(), phase, target);
+      return err::PLAN_FAILED;
+    }
 
     int attempts = plan_retry_count_ + 1;
     moveit::planning_interface::MoveGroupInterface::Plan plan;
@@ -237,8 +296,11 @@ private:
 
   // Drive a finger joint to `target` metres.  Uses the gripper MoveGroup
   // (which is wired to the gripper controller through MoveIt).
-  int setGripper(MoveGroupInterface::SharedPtr grip,
-                 double target_m, double speed_scale)
+  // compliance_grasp: close until contact; success if finger stalls with object held
+  // (hardware layer switches to low-KP hold in openarm_hardware).
+  int setGripper(MoveGroupInterfacePtr grip,
+                 double target_m, double speed_scale,
+                 bool compliance_grasp = false)
   {
     if (stop_requested_.load()) return err::STOPPED_BY_USER;
     grip->setMaxVelocityScalingFactor(speed_scale);
@@ -252,15 +314,19 @@ private:
     if (grip->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
       return err::PLAN_FAILED;
     }
-    if (grip->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
-      return err::EXECUTE_FAILED;
+    const auto exec_code = grip->execute(plan);
+    if (exec_code == moveit::core::MoveItErrorCode::SUCCESS) {
+      return err::OK;
     }
-    return err::OK;
+    if (compliance_grasp && isGripped(grip)) {
+      return err::OK;
+    }
+    return err::EXECUTE_FAILED;
   }
 
   // True if any finger is still further away than `gripper_close_thresh_`
   // from fully closed -> object is held.
-  bool isGripped(MoveGroupInterface::SharedPtr grip) const
+  bool isGripped(MoveGroupInterfacePtr grip) const
   {
     auto cur = grip->getCurrentJointValues();
     for (auto v : cur) {
@@ -327,18 +393,18 @@ private:
     rc = linearMoveTo(a, grasp, speed, "pick.descend");
     if (rc) return rc;
 
-    publishFb(gh, "grasping", "pick.close_gripper", 0.55, "closing gripper");
-    rc = setGripper(g, gripper_closed_pos_, speed);
+    publishFb(gh, "grasping", "pick.close_gripper", 0.55, "grasping object");
+    rc = setGripper(g, gripper_closed_pos_, speed, true);
     if (rc) return rc;
 
     if (!isGripped(g)) {
       RCLCPP_WARN(get_logger(), "pick: gripper closed empty, retrying once");
-      // simple retry: lift, re-descend, close
+      // simple retry: lift, re-descend, grasp
       for (int i = 0; i < grasp_retry_count_ && !isGripped(g); ++i) {
         linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift");
         setGripper(g, gripper_open_pos_, speed);
         linearMoveTo(a, grasp, speed, "pick.retry_descend");
-        setGripper(g, gripper_closed_pos_, speed);
+        setGripper(g, gripper_closed_pos_, speed, true);
       }
       if (!isGripped(g)) return err::GRIP_NOT_HELD;
     }
@@ -506,7 +572,7 @@ private:
   void handleHome(const std::shared_ptr<openarm_skills::srv::GotoHome::Request> req,
                   std::shared_ptr<openarm_skills::srv::GotoHome::Response> resp)
   {
-    auto run_one = [&](MoveGroupInterface::SharedPtr arm) -> int {
+    auto run_one = [&](MoveGroupInterfacePtr arm) -> int {
       arm->setMaxVelocityScalingFactor(req->speed_scale > 0 ? req->speed_scale
                                                             : transport_speed_scale_);
       arm->setNamedTarget("home");
@@ -536,12 +602,16 @@ private:
       return;
     }
     double target = gripper_open_pos_;
+    bool compliance_grasp = false;
     if (req->position > 0.0) target = req->position;
     else if (req->action == "close")       target = gripper_closed_pos_;
     else if (req->action == "half_close")  target = gripper_half_pos_;
-    else if (req->action == "open")        target = gripper_open_pos_;
+    else if (req->action == "grasp") {
+      target = gripper_closed_pos_;
+      compliance_grasp = true;
+    } else if (req->action == "open")        target = gripper_open_pos_;
 
-    int rc = setGripper(g, target, default_speed_scale_);
+    int rc = setGripper(g, target, default_speed_scale_, compliance_grasp);
     resp->result_code = rc;
     resp->success = (rc == err::OK);
     resp->message = (rc == err::OK) ? "gripper command done" : "gripper failed";
@@ -553,11 +623,13 @@ private:
   std::string left_arm_group_, right_arm_group_;
   std::string left_grip_group_, right_grip_group_;
   std::string base_frame_;
+  std::string left_eef_link_, right_eef_link_;
   std::string perception_srv_name_;
+  double goal_pos_tol_, goal_ori_tol_;
 
   double default_speed_scale_, transport_speed_scale_;
   double cartesian_eef_step_, cartesian_jump_thresh_, cartesian_min_fraction_;
-  double approach_offset_m_, retreat_offset_m_, step_timeout_s_;
+  double approach_offset_m_, retreat_offset_m_, step_timeout_s_, planning_time_s_;
   int    plan_retry_count_, grasp_retry_count_;
   double gripper_open_pos_, gripper_half_pos_, gripper_closed_pos_;
   double gripper_close_thresh_;
@@ -565,7 +637,7 @@ private:
   double perception_timeout_s_;
 
   rclcpp::Node::SharedPtr mg_node_;
-  MoveGroupInterface::SharedPtr left_arm_, right_arm_, left_grip_, right_grip_;
+  MoveGroupInterfacePtr left_arm_, right_arm_, left_grip_, right_grip_;
 
   rclcpp_action::Server<PickPlaceAction>::SharedPtr pick_place_server_;
   rclcpp::Service<openarm_skills::srv::Stop>::SharedPtr stop_srv_;

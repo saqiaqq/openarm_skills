@@ -7,7 +7,12 @@ skill_server:
     right_arm_group: "right_arm"
     left_gripper_group: "left_gripper"
     right_gripper_group: "right_gripper"
-    base_frame: "base_link"
+    # Must match the URDF root used by demo.launch.py (v10 bimanual → "world").
+    base_frame: "world"
+    left_eef_link: "openarm_left_hand_tcp"
+    right_eef_link: "openarm_right_hand_tcp"
+    goal_position_tolerance_m: 0.01
+    goal_orientation_tolerance_rad: 0.1
 
     # ------------------------------------------------------------------
     # Motion defaults  (PRD task 1 / 6: low speed during grasp/place)
@@ -20,14 +25,15 @@ skill_server:
     approach_offset_m: 0.05
     retreat_offset_m: 0.05
     step_timeout_s: 10.0
+    planning_time_s: 15.0
     plan_retry_count: 2
     grasp_retry_count: 1
 
     # ------------------------------------------------------------------
     # Gripper finger targets (m).  Match SRDF group_state values.
     # ------------------------------------------------------------------
-    gripper_open_pos: 0.044
-    gripper_half_pos: 0.022
+    gripper_open_pos: 0.040
+    gripper_half_pos: 0.020
     gripper_closed_pos: 0.0
     gripper_close_threshold_m: 0.001  # below this finger position => "not gripped"
 
