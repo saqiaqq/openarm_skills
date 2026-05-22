@@ -575,6 +575,7 @@ private:
     auto run_one = [&](MoveGroupInterfacePtr arm) -> int {
       arm->setMaxVelocityScalingFactor(req->speed_scale > 0 ? req->speed_scale
                                                             : transport_speed_scale_);
+      arm->setStartStateToCurrentState();
       arm->setNamedTarget("home");
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       if (arm->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) return err::PLAN_FAILED;
