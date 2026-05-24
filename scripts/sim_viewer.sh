@@ -18,7 +18,7 @@
 #   #   scp -r ROBOT_IP:~/code/openArm/install/openarm_description \
 #   #              ~/code/openArm_viewer/install/
 #
-set -euo pipefail
+set -eo pipefail
 
 ROBOT_IP="${1:-}"
 DOMAIN_ID="${2:-0}"
