@@ -74,12 +74,9 @@ do
   fi
 done
 
-if [[ -n "${RVIZ_CFG}" ]]; then
-  echo "[sim_viewer] Using RViz config: ${RVIZ_CFG}"
-  exec ros2 run rviz2 rviz2 -d "${RVIZ_CFG}"
-else
-  echo "[sim_viewer] No moveit.rviz found, starting RViz without config."
-  echo "             Tip: Add a RobotModel display (topic: /robot_description)"
-  echo "                  and a JointState display (topic: /joint_states)"
-  exec ros2 run rviz2 rviz2
-fi
+# Use the dedicated remote_viewer launch file which loads robot_description,
+# SRDF and kinematics parameters from the LOCAL workspace so the MoveIt
+# MotionPlanning RViz plugin can display the robot model.
+# joint_states and TF are received over the network from the robot machine.
+echo "[sim_viewer] Launching remote_viewer.launch.py (robot_description loaded locally)"
+exec ros2 launch openarm_skills remote_viewer.launch.py
