@@ -270,13 +270,27 @@ private:
     arm->setMaxVelocityScalingFactor(speed_scale);
     arm->setMaxAccelerationScalingFactor(speed_scale);
     arm->setPlanningTime(planning_time_s_);
+    // Explicitly sync start state so the IK seed equals the true current
+    // joint configuration.  This prevents KDL from wandering to a distant
+    // but pose-equivalent IK solution (the "full-revolution" problem).
     arm->setStartStateToCurrentState();
 
     const std::string eef = arm->getEndEffectorLink();
-    if (!arm->setPoseTarget(target, eef)) {
-      RCLCPP_ERROR(get_logger(), "[%s] IK failed for link '%s'", phase.c_str(), eef.c_str());
-      logTargetPose(get_logger(), phase, target);
-      return err::PLAN_FAILED;
+    // setJointValueTarget(pose, eef) solves IK immediately using current
+    // state as seed and stores the resulting joint angles as the goal.
+    // This is more consistent than setPoseTarget() which defers IK to
+    // planning time and may pick a different seed.
+    if (!arm->setJointValueTarget(target, eef)) {
+      RCLCPP_WARN(get_logger(),
+                  "[%s] IK via setJointValueTarget failed for '%s', "
+                  "falling back to setPoseTarget",
+                  phase.c_str(), eef.c_str());
+      if (!arm->setPoseTarget(target, eef)) {
+        RCLCPP_ERROR(get_logger(), "[%s] IK failed for link '%s'",
+                     phase.c_str(), eef.c_str());
+        logTargetPose(get_logger(), phase, target);
+        return err::PLAN_FAILED;
+      }
     }
 
     // Try Pilz PTP first: produces shortest joint-space path, avoids wild
