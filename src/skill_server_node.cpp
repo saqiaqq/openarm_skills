@@ -279,17 +279,32 @@ private:
       return err::PLAN_FAILED;
     }
 
-    int attempts = plan_retry_count_ + 1;
+    // Try Pilz PTP first: produces shortest joint-space path, avoids wild
+    // rotations caused by OMPL picking a distant IK solution.  Fall back to
+    // OMPL RRTConnect if Pilz cannot solve (e.g. singularity at start state).
+    static const std::vector<std::pair<std::string, std::string>> kPipelines = {
+      {"pilz_industrial_motion_planner", "PTP"},
+      {"ompl",                           "RRTConnect"},
+    };
     moveit::planning_interface::MoveGroupInterface::Plan plan;
-    while (attempts-- > 0 && !stop_requested_.load()) {
-      if (arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-        if (arm->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-          return err::OK;
+    for (const auto & [pipeline, planner] : kPipelines) {
+      arm->setPlanningPipelineId(pipeline);
+      arm->setPlannerId(planner);
+      int attempts = plan_retry_count_ + 1;
+      while (attempts-- > 0 && !stop_requested_.load()) {
+        if (arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+          if (arm->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+            return err::OK;
+          }
+          RCLCPP_WARN(get_logger(), "[%s][%s] execute failed, retrying",
+                      phase.c_str(), planner.c_str());
+          continue;
         }
-        RCLCPP_WARN(get_logger(), "[%s] execute failed, retrying", phase.c_str());
-        continue;
+        RCLCPP_WARN(get_logger(), "[%s][%s] plan failed, retrying",
+                    phase.c_str(), planner.c_str());
       }
-      RCLCPP_WARN(get_logger(), "[%s] plan failed, retrying", phase.c_str());
+      RCLCPP_WARN(get_logger(), "[%s] %s exhausted, trying next planner",
+                  phase.c_str(), planner.c_str());
     }
     return err::PLAN_FAILED;
   }
@@ -391,6 +406,13 @@ private:
 
     publishFb(gh, "grasping", "pick.descend", 0.45, "descending to grasp");
     rc = linearMoveTo(a, grasp, speed, "pick.descend");
+    if (rc) {
+      // Cartesian straight-line descent failed (IK fraction below threshold).
+      // Fall back to joint-space planning which is less strict about linearity.
+      RCLCPP_WARN(get_logger(),
+                  "pick.descend cartesian failed, falling back to joint-space");
+      rc = jointMoveTo(a, grasp, speed, "pick.descend.jnt");
+    }
     if (rc) return rc;
 
     publishFb(gh, "grasping", "pick.close_gripper", 0.55, "grasping object");
@@ -401,9 +423,11 @@ private:
       RCLCPP_WARN(get_logger(), "pick: gripper closed empty, retrying once");
       // simple retry: lift, re-descend, grasp
       for (int i = 0; i < grasp_retry_count_ && !isGripped(g); ++i) {
-        linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift");
+        rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift");
+        if (rc) jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift.jnt");
         setGripper(g, gripper_open_pos_, speed);
-        linearMoveTo(a, grasp, speed, "pick.retry_descend");
+        rc = linearMoveTo(a, grasp, speed, "pick.retry_descend");
+        if (rc) jointMoveTo(a, grasp, speed, "pick.retry_descend.jnt");
         setGripper(g, gripper_closed_pos_, speed, true);
       }
       if (!isGripped(g)) return err::GRIP_NOT_HELD;
@@ -411,6 +435,11 @@ private:
 
     publishFb(gh, "grasping", "pick.retreat", 0.65, "lifting object");
     rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retreat");
+    if (rc) {
+      RCLCPP_WARN(get_logger(),
+                  "pick.retreat cartesian failed, falling back to joint-space");
+      rc = jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retreat.jnt");
+    }
     return rc;
   }
 
@@ -429,6 +458,11 @@ private:
 
     publishFb(gh, "placing", "place.descend", 0.85, "descending to place");
     rc = linearMoveTo(a, place, speed, "place.descend");
+    if (rc) {
+      RCLCPP_WARN(get_logger(),
+                  "place.descend cartesian failed, falling back to joint-space");
+      rc = jointMoveTo(a, place, speed, "place.descend.jnt");
+    }
     if (rc) return rc;
 
     publishFb(gh, "placing", "place.open_gripper", 0.92, "opening gripper");
@@ -437,6 +471,11 @@ private:
 
     publishFb(gh, "placing", "place.retreat", 0.97, "lifting away");
     rc = linearMoveTo(a, offsetZ(place, retreat), speed, "place.retreat");
+    if (rc) {
+      RCLCPP_WARN(get_logger(),
+                  "place.retreat cartesian failed, falling back to joint-space");
+      rc = jointMoveTo(a, offsetZ(place, retreat), speed, "place.retreat.jnt");
+    }
     return rc;
   }
 
