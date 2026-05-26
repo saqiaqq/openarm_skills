@@ -37,6 +37,10 @@ skill_server:
     planning_time_s: 15.0
     plan_retry_count: 2
     grasp_retry_count: 1
+    # RViz / fake-hardware 调试用：没有真实物体时，夹爪会完全闭合，
+    # 正常逻辑会判定 GRIP_NOT_HELD 并中止。打开后会假定已经抓住，
+    # 继续执行后续 place 流程；真实机器人抓取测试前请改回 false。
+    debug_assume_grasp_success: true
 
     # ------------------------------------------------------------------
     # Gripper finger targets (m).  Match SRDF group_state values.

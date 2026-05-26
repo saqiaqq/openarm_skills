@@ -15,6 +15,7 @@
 //   Service : /openarm/gripper                    [openarm_skills/srv/Gripper]
 //   Client  : /openarm/detect_grasp_pose          [openarm_skills/srv/DetectGraspPose]
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -87,6 +88,7 @@ public:
     planning_time_s_        = get("planning_time_s",   15.0);
     plan_retry_count_       = get("plan_retry_count",  2);
     grasp_retry_count_      = get("grasp_retry_count", 1);
+    debug_assume_grasp_success_ = get("debug_assume_grasp_success", false);
 
     gripper_open_pos_       = get("gripper_open_pos",   0.040);
     gripper_half_pos_       = get("gripper_half_pos",   0.020);
@@ -568,6 +570,92 @@ private:
     return err::EXECUTE_FAILED;
   }
 
+  double currentGripperTargetOrClosed(MoveGroupInterfacePtr grip) const
+  {
+    if (!grip) return gripper_closed_pos_;
+
+    auto cur = grip->getCurrentJointValues();
+    if (cur.empty()) return gripper_closed_pos_;
+
+    double sum = 0.0;
+    for (auto v : cur) sum += v;
+    double target = sum / static_cast<double>(cur.size());
+    target = std::max(gripper_closed_pos_, std::min(gripper_open_pos_, target));
+    return target;
+  }
+
+  int moveArmToJoints(MoveGroupInterfacePtr arm,
+                      const std::vector<double> & joints,
+                      double speed_scale,
+                      const std::string & phase)
+  {
+    if (stop_requested_.load()) return err::STOPPED_BY_USER;
+    if (!arm || joints.empty()) return err::BAD_REQUEST;
+
+    arm->setMaxVelocityScalingFactor(speed_scale);
+    arm->setMaxAccelerationScalingFactor(speed_scale);
+    arm->setPlanningTime(planning_time_s_);
+    arm->setStartStateToCurrentState();
+    arm->setJointValueTarget(joints);
+
+    static const std::vector<std::pair<std::string, std::string>> kPipelines = {
+      {"pilz_industrial_motion_planner", "PTP"},
+      {"ompl",                           "RRTConnect"},
+    };
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    for (const auto & [pipeline, planner] : kPipelines) {
+      arm->setPlanningPipelineId(pipeline);
+      arm->setPlannerId(planner);
+      int attempts = plan_retry_count_ + 1;
+      while (attempts-- > 0 && !stop_requested_.load()) {
+        if (arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+          logIkResult(plan, phase, planner);
+          if (arm->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+            arm->setStartStateToCurrentState();
+            return err::OK;
+          }
+          RCLCPP_WARN(get_logger(), "[%s][%s] execute failed, retrying",
+                      phase.c_str(), planner.c_str());
+          continue;
+        }
+        RCLCPP_WARN(get_logger(), "[%s][%s] plan failed, retrying",
+                    phase.c_str(), planner.c_str());
+      }
+      RCLCPP_WARN(get_logger(), "[%s] %s exhausted, trying next planner",
+                  phase.c_str(), planner.c_str());
+    }
+
+    last_failure_phase_ = phase;
+    last_failure_reason_ = "joint return planners exhausted (PTP + RRTConnect)";
+    return err::PLAN_FAILED;
+  }
+
+  int moveArmHome(MoveGroupInterfacePtr arm, double speed_scale, const std::string & phase)
+  {
+    if (stop_requested_.load()) return err::STOPPED_BY_USER;
+    if (!arm) return err::BAD_REQUEST;
+
+    arm->setMaxVelocityScalingFactor(speed_scale);
+    arm->setMaxAccelerationScalingFactor(speed_scale);
+    arm->setPlanningTime(planning_time_s_);
+    arm->setStartStateToCurrentState();
+    arm->setNamedTarget("home");
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    if (arm->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      last_failure_phase_ = phase;
+      last_failure_reason_ = "home plan failed";
+      return err::PLAN_FAILED;
+    }
+    if (arm->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      last_failure_phase_ = phase;
+      last_failure_reason_ = "home execute failed";
+      return err::EXECUTE_FAILED;
+    }
+    arm->setStartStateToCurrentState();
+    return err::OK;
+  }
+
   // True if any finger is still further away than `gripper_close_thresh_`
   // from fully closed -> object is held.
   bool isGripped(MoveGroupInterfacePtr grip) const
@@ -701,21 +789,29 @@ private:
     if (rc) return rc;
 
     if (!isGripped(g)) {
-      // With the new pick.open_gripper-first step the retry should rarely
-      // trigger — if it still does, the object is genuinely outside grasp
-      // range, so a lift/open/descend cycle is the right recovery.
-      RCLCPP_WARN(get_logger(),
-                  "pick: gripper closed empty after first attempt, retrying "
-                  "lift→open→descend×%d", grasp_retry_count_);
-      for (int i = 0; i < grasp_retry_count_ && !isGripped(g); ++i) {
-        rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift");
-        if (rc) jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift.jnt");
-        setGripper(g, gripper_open_pos_, speed);
-        rc = linearMoveTo(a, grasp, speed, "pick.retry_descend");
-        if (rc) jointMoveTo(a, grasp, speed, "pick.retry_descend.jnt");
-        setGripper(g, gripper_closed_pos_, speed, true);
+      if (debug_assume_grasp_success_) {
+        RCLCPP_WARN(get_logger(),
+                    "pick.close_gripper: gripper closed empty; "
+                    "debug_assume_grasp_success=true, continuing to place");
+        publishFb(gh, "grasping", "pick.fake_grasp", 0.60,
+                  "RViz debug: assuming object is held");
+      } else {
+        // With the new pick.open_gripper-first step the retry should rarely
+        // trigger — if it still does, the object is genuinely outside grasp
+        // range, so a lift/open/descend cycle is the right recovery.
+        RCLCPP_WARN(get_logger(),
+                    "pick: gripper closed empty after first attempt, retrying "
+                    "lift→open→descend×%d", grasp_retry_count_);
+        for (int i = 0; i < grasp_retry_count_ && !isGripped(g); ++i) {
+          rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift");
+          if (rc) jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift.jnt");
+          setGripper(g, gripper_open_pos_, speed);
+          rc = linearMoveTo(a, grasp, speed, "pick.retry_descend");
+          if (rc) jointMoveTo(a, grasp, speed, "pick.retry_descend.jnt");
+          setGripper(g, gripper_closed_pos_, speed, true);
+        }
+        if (!isGripped(g)) return err::GRIP_NOT_HELD;
       }
-      if (!isGripped(g)) return err::GRIP_NOT_HELD;
     }
 
     publishFb(gh, "grasping", "pick.retreat", 0.65, "lifting object");
@@ -756,6 +852,10 @@ private:
       RCLCPP_WARN(get_logger(),
                   "place.descend cartesian failed, falling back to joint-space");
       rc = jointMoveTo(a, place, speed, "place.descend.jnt");
+      if (!rc) {
+        last_failure_phase_.clear();
+        last_failure_reason_.clear();
+      }
     }
     if (rc) return rc;
 
@@ -769,8 +869,60 @@ private:
       RCLCPP_WARN(get_logger(),
                   "place.retreat cartesian failed, falling back to joint-space");
       rc = jointMoveTo(a, offsetZ(place, retreat), speed, "place.retreat.jnt");
+      if (!rc) {
+        last_failure_phase_.clear();
+        last_failure_reason_.clear();
+      }
     }
     return rc;
+  }
+
+  int doPostPlaceReturn(const std::string & arm,
+                        const std::vector<double> & start_arm_joints,
+                        double start_gripper_target,
+                        double speed,
+                        const std::shared_ptr<PickPlaceGoalHandle> & gh)
+  {
+    auto a = armGroup(arm); auto g = gripGroup(arm);
+    if (!a || !g) return err::BAD_REQUEST;
+
+    const double return_speed = std::min(speed, transport_speed_scale_);
+    int rc = err::OK;
+
+    if (!start_arm_joints.empty()) {
+      publishFb(gh, "returning", "return.start", 0.985,
+                "returning to start pose");
+      rc = moveArmToJoints(a, start_arm_joints, return_speed, "return.start");
+      if (rc == err::OK) {
+        last_failure_phase_.clear();
+        last_failure_reason_.clear();
+      } else if (rc == err::STOPPED_BY_USER) {
+        return rc;
+      } else {
+        RCLCPP_WARN(get_logger(),
+                    "return.start failed (rc=%d), falling back to home", rc);
+      }
+    }
+
+    if (start_arm_joints.empty() || rc != err::OK) {
+      publishFb(gh, "returning", "return.home", 0.985,
+                "returning to home pose");
+      rc = moveArmHome(a, return_speed, "return.home");
+      if (rc) return rc;
+      last_failure_phase_.clear();
+      last_failure_reason_.clear();
+    }
+
+    publishFb(gh, "returning", "return.restore_gripper", 0.995,
+              "restoring gripper state");
+    rc = setGripper(g, start_gripper_target, speed);
+    if (rc) {
+      last_failure_phase_ = "return.restore_gripper";
+      last_failure_reason_ = "failed to restore initial gripper state";
+      return rc;
+    }
+
+    return err::OK;
   }
 
   // ===========================================================================
@@ -836,6 +988,20 @@ private:
     const double speed    = goal->speed_scale > 0 ? goal->speed_scale
                                                   : default_speed_scale_;
 
+    auto start_arm = armGroup(goal->arm);
+    auto start_grip = gripGroup(goal->arm);
+    std::vector<double> start_arm_joints;
+    double start_gripper_target = gripper_closed_pos_;
+    if (start_arm) {
+      start_arm_joints = start_arm->getCurrentJointValues();
+    }
+    if (start_grip) {
+      start_gripper_target = currentGripperTargetOrClosed(start_grip);
+    }
+    RCLCPP_INFO(get_logger(),
+                "execute: captured return target joints=%zu gripper=%.4f",
+                start_arm_joints.size(), start_gripper_target);
+
     geometry_msgs::msg::Pose grasp = goal->grasp_pose;
     geometry_msgs::msg::Pose place = goal->place_pose;
 
@@ -879,6 +1045,9 @@ private:
 
     rc = doPlace(goal->arm, place, approach, retreat, speed, gh);
     if (rc) return finish(gh, result, rc, "place failed");
+
+    rc = doPostPlaceReturn(goal->arm, start_arm_joints, start_gripper_target, speed, gh);
+    if (rc) return finish(gh, result, rc, "post-place return failed");
 
     return finish(gh, result, err::OK, "pick_and_place done");
   }
@@ -1012,6 +1181,7 @@ private:
   double cartesian_eef_step_, cartesian_jump_thresh_, cartesian_min_fraction_;
   double approach_offset_m_, retreat_offset_m_, step_timeout_s_, planning_time_s_;
   int    plan_retry_count_, grasp_retry_count_;
+  bool   debug_assume_grasp_success_;
   double gripper_open_pos_, gripper_half_pos_, gripper_closed_pos_;
   double gripper_close_thresh_;
   double workspace_radius_, min_z_, max_z_;
