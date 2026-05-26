@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -26,10 +27,12 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/robot_state/robot_state.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 
 #include "openarm_skills/action/pick_place.hpp"
 #include "openarm_skills/srv/stop.hpp"
@@ -43,6 +46,7 @@ namespace openarm_skills
 
 using PickPlaceAction = openarm_skills::action::PickPlace;
 using PickPlaceGoalHandle = rclcpp_action::ServerGoalHandle<PickPlaceAction>;
+using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 using moveit::planning_interface::MoveGroupInterface;
 // Humble 版 MoveIt2 的 MoveGroupInterface 没有 SharedPtr typedef，手动补充
 using MoveGroupInterfacePtr = std::shared_ptr<MoveGroupInterface>;
@@ -106,6 +110,14 @@ public:
     // ---- service clients ---------------------------------------------------
     perception_client_ = this->create_client<openarm_skills::srv::DetectGraspPose>(
       perception_srv_name_);
+    traj_callback_group_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    left_arm_traj_client_ = rclcpp_action::create_client<FollowJointTrajectory>(
+      this, "/left_joint_trajectory_controller/follow_joint_trajectory",
+      traj_callback_group_);
+    right_arm_traj_client_ = rclcpp_action::create_client<FollowJointTrajectory>(
+      this, "/right_joint_trajectory_controller/follow_joint_trajectory",
+      traj_callback_group_);
 
     // ---- service servers ---------------------------------------------------
     stop_srv_ = this->create_service<openarm_skills::srv::Stop>(
@@ -656,6 +668,144 @@ private:
     return err::OK;
   }
 
+  bool makeHomeTrajectoryGoal(MoveGroupInterfacePtr arm,
+                              double speed_scale,
+                              FollowJointTrajectory::Goal & goal,
+                              double & duration_s,
+                              const std::string & label)
+  {
+    if (!arm) return false;
+
+    const auto * jmg =
+      arm->getRobotModel()->getJointModelGroup(arm->getName());
+    if (!jmg) return false;
+
+    moveit::core::RobotState target_state(arm->getRobotModel());
+    target_state.setToDefaultValues();
+    target_state.setToDefaultValues(jmg, "home");
+
+    std::vector<double> positions;
+    target_state.copyJointGroupPositions(jmg, positions);
+    const auto names = arm->getJointNames();
+    const auto current = arm->getCurrentJointValues();
+    if (positions.size() != names.size()) {
+      RCLCPP_ERROR(get_logger(),
+                   "goto_home(%s): home joint count mismatch (%zu positions vs %zu names)",
+                   label.c_str(), positions.size(), names.size());
+      return false;
+    }
+    if (current.size() != positions.size()) {
+      RCLCPP_ERROR(get_logger(),
+                   "goto_home(%s): current joint count mismatch (%zu current vs %zu target)",
+                   label.c_str(), current.size(), positions.size());
+      return false;
+    }
+
+    goal.trajectory.joint_names = names;
+    trajectory_msgs::msg::JointTrajectoryPoint point;
+    point.positions = positions;
+    point.velocities.assign(positions.size(), 0.0);
+
+    const double clamped_speed = std::max(0.05, std::min(1.0, speed_scale));
+    duration_s = 0.0;
+    const auto & joint_models = jmg->getActiveJointModels();
+    for (size_t i = 0; i < positions.size() && i < current.size(); ++i) {
+      double max_vel = 1.0;
+      if (i < joint_models.size()) {
+        const auto & bounds = joint_models[i]->getVariableBounds();
+        if (!bounds.empty() && bounds[0].velocity_bounded_ &&
+            bounds[0].max_velocity_ > 1e-6) {
+          max_vel = bounds[0].max_velocity_;
+        }
+      }
+      duration_s = std::max(duration_s,
+                            std::abs(positions[i] - current[i]) / (max_vel * clamped_speed));
+    }
+    duration_s = std::max(0.5, duration_s);
+    point.time_from_start.sec = static_cast<int32_t>(duration_s);
+    point.time_from_start.nanosec =
+      static_cast<uint32_t>((duration_s - point.time_from_start.sec) * 1e9);
+    goal.trajectory.points.push_back(point);
+    return true;
+  }
+
+  void setTrajectoryDuration(FollowJointTrajectory::Goal & goal, double duration_s)
+  {
+    if (goal.trajectory.points.empty()) return;
+    auto & point = goal.trajectory.points.front();
+    point.time_from_start.sec = static_cast<int32_t>(duration_s);
+    point.time_from_start.nanosec =
+      static_cast<uint32_t>((duration_s - point.time_from_start.sec) * 1e9);
+  }
+
+  int executeBothHomeWithControllers(double speed_scale)
+  {
+    if (!left_arm_traj_client_->wait_for_action_server(std::chrono::seconds(2)) ||
+        !right_arm_traj_client_->wait_for_action_server(std::chrono::seconds(2))) {
+      RCLCPP_ERROR(get_logger(), "goto_home(both): arm trajectory controller unavailable");
+      return err::EXECUTE_FAILED;
+    }
+
+    FollowJointTrajectory::Goal left_goal;
+    FollowJointTrajectory::Goal right_goal;
+    double left_duration_s = 0.0;
+    double right_duration_s = 0.0;
+    if (!makeHomeTrajectoryGoal(left_arm_, speed_scale, left_goal, left_duration_s, "left") ||
+        !makeHomeTrajectoryGoal(right_arm_, speed_scale, right_goal, right_duration_s, "right")) {
+      return err::PLAN_FAILED;
+    }
+    const double sync_duration_s = std::max(left_duration_s, right_duration_s);
+    setTrajectoryDuration(left_goal, sync_duration_s);
+    setTrajectoryDuration(right_goal, sync_duration_s);
+
+    RCLCPP_INFO(get_logger(),
+                "goto_home(both): sending synchronized home goals "
+                "(left=%.2fs right=%.2fs sync=%.2fs speed=%.2f)",
+                left_duration_s, right_duration_s, sync_duration_s, speed_scale);
+    auto left_goal_future = left_arm_traj_client_->async_send_goal(left_goal);
+    auto right_goal_future = right_arm_traj_client_->async_send_goal(right_goal);
+
+    if (left_goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready ||
+        right_goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+      RCLCPP_ERROR(get_logger(), "goto_home(both): timed out waiting for goal acceptance");
+      return err::EXECUTE_FAILED;
+    }
+
+    auto left_handle = left_goal_future.get();
+    auto right_handle = right_goal_future.get();
+    if (!left_handle || !right_handle) {
+      RCLCPP_ERROR(get_logger(), "goto_home(both): controller rejected home goal");
+      return err::EXECUTE_FAILED;
+    }
+
+    auto left_result_future = left_arm_traj_client_->async_get_result(left_handle);
+    auto right_result_future = right_arm_traj_client_->async_get_result(right_handle);
+    if (left_result_future.wait_for(std::chrono::seconds(30)) != std::future_status::ready ||
+        right_result_future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+      RCLCPP_ERROR(get_logger(), "goto_home(both): timed out waiting for execution result");
+      return err::EXECUTE_FAILED;
+    }
+
+    const auto left_wrapped = left_result_future.get();
+    const auto right_wrapped = right_result_future.get();
+    const bool left_ok =
+      left_wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+      left_wrapped.result &&
+      left_wrapped.result->error_code == FollowJointTrajectory::Result::SUCCESSFUL;
+    const bool right_ok =
+      right_wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+      right_wrapped.result &&
+      right_wrapped.result->error_code == FollowJointTrajectory::Result::SUCCESSFUL;
+    if (!left_ok || !right_ok) {
+      RCLCPP_ERROR(get_logger(), "goto_home(both): controller execution failed");
+      return err::EXECUTE_FAILED;
+    }
+
+    left_arm_->setStartStateToCurrentState();
+    right_arm_->setStartStateToCurrentState();
+    return err::OK;
+  }
+
   // True if any finger is still further away than `gripper_close_thresh_`
   // from fully closed -> object is held.
   bool isGripped(MoveGroupInterfacePtr grip) const
@@ -1108,14 +1258,29 @@ private:
   {
     const double speed = req->speed_scale > 0 ? req->speed_scale : transport_speed_scale_;
 
-    auto run_one = [&](MoveGroupInterfacePtr arm) -> int {
+    using Plan = moveit::planning_interface::MoveGroupInterface::Plan;
+
+    auto plan_one = [&](MoveGroupInterfacePtr arm, const std::string & label,
+                        Plan & plan) -> int {
+      if (!arm) return err::BAD_REQUEST;
       arm->setMaxVelocityScalingFactor(speed);
       arm->setMaxAccelerationScalingFactor(speed);
       arm->setStartStateToCurrentState();
       arm->setNamedTarget("home");
-      moveit::planning_interface::MoveGroupInterface::Plan plan;
-      if (arm->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) return err::PLAN_FAILED;
-      if (arm->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) return err::EXECUTE_FAILED;
+      if (arm->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_ERROR(get_logger(), "goto_home(%s): home plan failed", label.c_str());
+        return err::PLAN_FAILED;
+      }
+      return err::OK;
+    };
+
+    auto execute_one = [&](MoveGroupInterfacePtr arm, const std::string & label,
+                           const Plan & plan) -> int {
+      if (!arm) return err::BAD_REQUEST;
+      if (arm->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_ERROR(get_logger(), "goto_home(%s): home execute failed", label.c_str());
+        return err::EXECUTE_FAILED;
+      }
       // Sync state after execution so the next operation starts from the
       // correct (home) configuration rather than any cached pre-motion state.
       arm->setStartStateToCurrentState();
@@ -1123,8 +1288,19 @@ private:
     };
 
     int rc = err::OK;
-    if (req->arm == "left" || req->arm == "both")  rc = run_one(left_arm_);
-    if (rc == err::OK && (req->arm == "right" || req->arm == "both")) rc = run_one(right_arm_);
+    if (req->arm == "both") {
+      rc = executeBothHomeWithControllers(speed);
+    } else if (req->arm == "left") {
+      Plan plan;
+      rc = plan_one(left_arm_, "left", plan);
+      if (rc == err::OK) rc = execute_one(left_arm_, "left", plan);
+    } else if (req->arm == "right") {
+      Plan plan;
+      rc = plan_one(right_arm_, "right", plan);
+      if (rc == err::OK) rc = execute_one(right_arm_, "right", plan);
+    } else {
+      rc = err::BAD_REQUEST;
+    }
 
     // Clear the stop flag set by handleStop so that subsequent service calls
     // (e.g. gripper) are not immediately rejected with STOPPED_BY_USER.
@@ -1189,8 +1365,11 @@ private:
 
   rclcpp::Node::SharedPtr mg_node_;
   MoveGroupInterfacePtr left_arm_, right_arm_, left_grip_, right_grip_;
+  rclcpp::CallbackGroup::SharedPtr traj_callback_group_;
 
   rclcpp_action::Server<PickPlaceAction>::SharedPtr pick_place_server_;
+  rclcpp_action::Client<FollowJointTrajectory>::SharedPtr left_arm_traj_client_;
+  rclcpp_action::Client<FollowJointTrajectory>::SharedPtr right_arm_traj_client_;
   rclcpp::Service<openarm_skills::srv::Stop>::SharedPtr stop_srv_;
   rclcpp::Service<openarm_skills::srv::GotoHome>::SharedPtr home_srv_;
   rclcpp::Service<openarm_skills::srv::Gripper>::SharedPtr gripper_srv_;
