@@ -64,3 +64,15 @@ skill_server:
     # ------------------------------------------------------------------
     perception_service: "/openarm/detect_grasp_pose"
     perception_timeout_s: 5.0
+
+    # ------------------------------------------------------------------
+    # Tray carry (/openarm/carry_action)
+    # ------------------------------------------------------------------
+    # Elbow angle for carry pose: 90 deg, forearm roughly horizontal.
+    carry_joint4_rad: 1.5708
+    # Default carry keeps all arm joints at home except joint4. Width changes use
+    # joint2 and joint5 equally so the gripper stays level.
+    carry_joint6_rad: 0.0
+    carry_joint7_rad: 0.0
+    # Default lateral TCP-to-TCP width (m) when only joint4 moves from home.
+    carry_default_width_m: 0.307

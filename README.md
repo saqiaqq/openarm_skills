@@ -11,6 +11,7 @@ flows with status feedback, plus a basic exception-handling envelope.
 | Action   | `/openarm/pick_place`             | `openarm_skills/action/PickPlace`       |
 | Service  | `/openarm/stop`                   | `openarm_skills/srv/Stop`               |
 | Service  | `/openarm/goto_home`              | `openarm_skills/srv/GotoHome`           |
+| Service  | `/openarm/carry_action`           | `openarm_skills/srv/CarryAction`        |
 | Service  | `/openarm/gripper`                | `openarm_skills/srv/Gripper`            |
 | Client   | `/openarm/detect_grasp_pose`      | `openarm_skills/srv/DetectGraspPose`    |
 
@@ -45,9 +46,10 @@ bash src/openarm_skills/scripts/test_openarm_skills.sh ~/code/openArm
 | 3 | `/openarm/gripper` | Service | `action: 'close'` |
 | 4 | `/openarm/gripper` | Service | `action: 'grasp'` — compliant close / hold (needs object for full test) |
 | 5 | `/openarm/goto_home` | Service | `ros2 service call /openarm/goto_home openarm_skills/srv/GotoHome "{arm: 'both', speed_scale: 0.15}"` |
-| 6 | `/openarm/stop` | Service | `ros2 service call /openarm/stop openarm_skills/srv/Stop "{cmd_id: 'stop-1'}"` |
-| 7 | `/openarm/pick_place` | Action | see § Quick start item 4 below |
-| 8 | `/openarm/detect_grasp_pose` | Client (in skill_server) | start `openarm_perception`; use `pose_source: camera` in pick_place |
+| 6 | `/openarm/carry_action` | Service | `ros2 service call /openarm/carry_action openarm_skills/srv/CarryAction "{width: 0.307, gripper: 'open', speed_scale: 0.15}"` |
+| 7 | `/openarm/stop` | Service | `ros2 service call /openarm/stop openarm_skills/srv/Stop "{cmd_id: 'stop-1'}"` |
+| 8 | `/openarm/pick_place` | Action | see § Quick start item 4 below |
+| 9 | `/openarm/detect_grasp_pose` | Client (in skill_server) | start `openarm_perception`; use `pose_source: camera` in pick_place |
 
 ```bash
 # 4. drive a pick & place from the CLI (upper_computer mode)

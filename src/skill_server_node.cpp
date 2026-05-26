@@ -12,6 +12,7 @@
 //   Action  : /openarm/pick_place                 [openarm_skills/action/PickPlace]
 //   Service : /openarm/stop                       [openarm_skills/srv/Stop]
 //   Service : /openarm/goto_home                  [openarm_skills/srv/GotoHome]
+//   Service : /openarm/carry_action               [openarm_skills/srv/CarryAction]
 //   Service : /openarm/gripper                    [openarm_skills/srv/Gripper]
 //   Client  : /openarm/detect_grasp_pose          [openarm_skills/srv/DetectGraspPose]
 
@@ -20,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <future>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -39,6 +41,7 @@
 #include "openarm_skills/action/pick_place.hpp"
 #include "openarm_skills/srv/stop.hpp"
 #include "openarm_skills/srv/goto_home.hpp"
+#include "openarm_skills/srv/carry_action.hpp"
 #include "openarm_skills/srv/gripper.hpp"
 #include "openarm_skills/srv/detect_grasp_pose.hpp"
 #include "openarm_skills/error_codes.hpp"
@@ -112,6 +115,11 @@ public:
                                   std::string("/openarm/detect_grasp_pose"));
     perception_timeout_s_   = get("perception_timeout_s", 5.0);
 
+    carry_joint4_rad_        = get("carry_joint4_rad", 1.5708);
+    carry_joint6_rad_        = get("carry_joint6_rad", 0.0);
+    carry_joint7_rad_        = get("carry_joint7_rad", 0.0);
+    carry_default_width_m_   = get("carry_default_width_m", 0.307);
+
     // ---- service clients ---------------------------------------------------
     perception_client_ = this->create_client<openarm_skills::srv::DetectGraspPose>(
       perception_srv_name_);
@@ -141,6 +149,11 @@ public:
     home_srv_ = this->create_service<openarm_skills::srv::GotoHome>(
       "/openarm/goto_home",
       std::bind(&SkillServerNode::handleHome, this,
+                std::placeholders::_1, std::placeholders::_2));
+
+    carry_srv_ = this->create_service<openarm_skills::srv::CarryAction>(
+      "/openarm/carry_action",
+      std::bind(&SkillServerNode::handleCarry, this,
                 std::placeholders::_1, std::placeholders::_2));
 
     gripper_srv_ = this->create_service<openarm_skills::srv::Gripper>(
@@ -174,10 +187,21 @@ public:
     configureArmMoveGroup(left_arm_, left_eef_link_, "left");
     configureArmMoveGroup(right_arm_, right_eef_link_, "right");
 
+    double fk_default_width = 0.0;
+    if (computeCarryWidth(0.0, fk_default_width)) {
+      carry_default_width_m_ = fk_default_width;
+    }
+    computeCarryWidthRange(carry_min_width_m_, carry_max_width_m_);
+
     RCLCPP_INFO(get_logger(),
                 "MoveGroup frame='%s' EEF: left=%s right=%s (planning_time=%.1fs)",
                 base_frame_.c_str(), left_eef_link_.c_str(), right_eef_link_.c_str(),
                 planning_time_s_);
+    RCLCPP_INFO(get_logger(),
+                "carry_action: default_width=%.3fm allowed_width=[%.3f, %.3f]m "
+                "(joint4=%.4frad)",
+                carry_default_width_m_, carry_min_width_m_, carry_max_width_m_,
+                carry_joint4_rad_);
   }
 
   void configureArmMoveGroup(MoveGroupInterfacePtr arm,
@@ -862,6 +886,322 @@ private:
       static_cast<uint32_t>((duration_s - point.time_from_start.sec) * 1e9);
   }
 
+  bool setNamedJoint(std::vector<double> & positions,
+                     const std::vector<std::string> & names,
+                     const std::string & joint_name,
+                     double value) const
+  {
+    for (size_t i = 0; i < names.size() && i < positions.size(); ++i) {
+      if (names[i] == joint_name) {
+        positions[i] = value;
+        return true;
+      }
+    }
+    RCLCPP_ERROR(get_logger(), "carry_action: joint '%s' not found", joint_name.c_str());
+    return false;
+  }
+
+  bool makeCarryPositions(MoveGroupInterfacePtr arm,
+                          const std::string & side,
+                          double theta,
+                          std::vector<double> & positions) const
+  {
+    if (!arm) return false;
+    const auto * jmg =
+      arm->getRobotModel()->getJointModelGroup(arm->getName());
+    if (!jmg) return false;
+
+    moveit::core::RobotState target_state(arm->getRobotModel());
+    target_state.setToDefaultValues();
+    target_state.setToDefaultValues(jmg, "home");
+    target_state.copyJointGroupPositions(jmg, positions);
+
+    const auto names = arm->getJointNames();
+    if (positions.size() != names.size()) {
+      RCLCPP_ERROR(get_logger(),
+                   "carry_action(%s): joint count mismatch (%zu positions vs %zu names)",
+                   side.c_str(), positions.size(), names.size());
+      return false;
+    }
+
+    const double side_theta = (side == "left") ? theta : -theta;
+    const std::string prefix = "openarm_" + side + "_joint";
+    return setNamedJoint(positions, names, prefix + "2", side_theta) &&
+           setNamedJoint(positions, names, prefix + "4", carry_joint4_rad_) &&
+           setNamedJoint(positions, names, prefix + "5", side_theta) &&
+           setNamedJoint(positions, names, prefix + "6", carry_joint6_rad_) &&
+           setNamedJoint(positions, names, prefix + "7", carry_joint7_rad_);
+  }
+
+  bool getJointBounds(MoveGroupInterfacePtr arm,
+                      const std::string & joint_name,
+                      double & lower,
+                      double & upper) const
+  {
+    if (!arm) return false;
+    const auto * jmg =
+      arm->getRobotModel()->getJointModelGroup(arm->getName());
+    if (!jmg) return false;
+
+    for (const auto * joint_model : jmg->getActiveJointModels()) {
+      if (joint_model->getName() != joint_name) continue;
+      const auto & bounds = joint_model->getVariableBounds();
+      if (bounds.empty() || !bounds[0].position_bounded_) return false;
+      lower = bounds[0].min_position_;
+      upper = bounds[0].max_position_;
+      return true;
+    }
+    return false;
+  }
+
+  bool carryThetaLimits(double & lower, double & upper) const
+  {
+    lower = -std::numeric_limits<double>::infinity();
+    upper = std::numeric_limits<double>::infinity();
+
+    auto add_bound = [&](MoveGroupInterfacePtr arm,
+                         const std::string & joint_name,
+                         double sign) -> bool {
+      double joint_lower = 0.0;
+      double joint_upper = 0.0;
+      if (!getJointBounds(arm, joint_name, joint_lower, joint_upper)) {
+        RCLCPP_ERROR(get_logger(), "carry_action: missing bounds for %s",
+                     joint_name.c_str());
+        return false;
+      }
+      if (sign > 0.0) {
+        lower = std::max(lower, joint_lower);
+        upper = std::min(upper, joint_upper);
+      } else {
+        lower = std::max(lower, -joint_upper);
+        upper = std::min(upper, -joint_lower);
+      }
+      return true;
+    };
+
+    if (!add_bound(left_arm_,  "openarm_left_joint2",  -1.0) ||
+        !add_bound(right_arm_, "openarm_right_joint2",  1.0) ||
+        !add_bound(left_arm_,  "openarm_left_joint5",  -1.0) ||
+        !add_bound(right_arm_, "openarm_right_joint5",  1.0)) {
+      return false;
+    }
+    return lower <= upper;
+  }
+
+  bool computeCarryWidth(double theta, double & width_m) const
+  {
+    if (!left_arm_ || !right_arm_) return false;
+
+    std::vector<double> left_positions;
+    std::vector<double> right_positions;
+    if (!makeCarryPositions(left_arm_, "left", theta, left_positions) ||
+        !makeCarryPositions(right_arm_, "right", theta, right_positions)) {
+      return false;
+    }
+
+    auto model = left_arm_->getRobotModel();
+    const auto * left_jmg = model->getJointModelGroup(left_arm_->getName());
+    const auto * right_jmg = model->getJointModelGroup(right_arm_->getName());
+    if (!left_jmg || !right_jmg) return false;
+
+    moveit::core::RobotState state(model);
+    state.setToDefaultValues();
+    state.setJointGroupPositions(left_jmg, left_positions);
+    state.setJointGroupPositions(right_jmg, right_positions);
+    state.update();
+
+    const auto & left_tf = state.getGlobalLinkTransform(left_eef_link_);
+    const auto & right_tf = state.getGlobalLinkTransform(right_eef_link_);
+    width_m = std::abs(left_tf.translation().y() - right_tf.translation().y());
+    return std::isfinite(width_m);
+  }
+
+  bool computeCarryWidthRange(double & min_width_m, double & max_width_m) const
+  {
+    double theta_lower = 0.0;
+    double theta_upper = 0.0;
+    if (!carryThetaLimits(theta_lower, theta_upper)) return false;
+
+    min_width_m = std::numeric_limits<double>::infinity();
+    max_width_m = 0.0;
+    constexpr int kSamples = 200;
+    for (int i = 0; i <= kSamples; ++i) {
+      const double t = theta_lower +
+        (theta_upper - theta_lower) * static_cast<double>(i) / kSamples;
+      double width = 0.0;
+      if (!computeCarryWidth(t, width)) return false;
+      min_width_m = std::min(min_width_m, width);
+      max_width_m = std::max(max_width_m, width);
+    }
+    return std::isfinite(min_width_m) && std::isfinite(max_width_m);
+  }
+
+  bool solveCarryThetaForWidth(double requested_width_m,
+                               double & theta,
+                               double & actual_width_m,
+                               std::string & message) const
+  {
+    if (!std::isfinite(requested_width_m) || requested_width_m < 0.0) {
+      message = "width must be finite and >= 0";
+      return false;
+    }
+
+    if (requested_width_m == 0.0) {
+      theta = 0.0;
+      if (!computeCarryWidth(theta, actual_width_m)) {
+        message = "failed to compute default carry width";
+        return false;
+      }
+      return true;
+    }
+
+    double theta_lower = 0.0;
+    double theta_upper = 0.0;
+    if (!carryThetaLimits(theta_lower, theta_upper)) {
+      message = "failed to compute carry joint limits";
+      return false;
+    }
+
+    double min_width = 0.0;
+    double max_width = 0.0;
+    if (!computeCarryWidthRange(min_width, max_width)) {
+      message = "failed to compute carry width range";
+      return false;
+    }
+
+    constexpr double kWidthTolerance = 0.003;
+    if (requested_width_m < min_width - kWidthTolerance ||
+        requested_width_m > max_width + kWidthTolerance) {
+      char buf[160];
+      snprintf(buf, sizeof(buf),
+               "width %.3fm out of range [%.3f, %.3f]m",
+               requested_width_m, min_width, max_width);
+      message = buf;
+      return false;
+    }
+
+    double best_theta = theta_lower;
+    double best_width = 0.0;
+    double best_err = std::numeric_limits<double>::infinity();
+    bool have_prev = false;
+    double prev_theta = 0.0;
+    double prev_width = 0.0;
+
+    constexpr int kSamples = 200;
+    for (int i = 0; i <= kSamples; ++i) {
+      const double t = theta_lower +
+        (theta_upper - theta_lower) * static_cast<double>(i) / kSamples;
+      double width = 0.0;
+      if (!computeCarryWidth(t, width)) {
+        message = "failed to compute carry width";
+        return false;
+      }
+
+      const double err = std::abs(width - requested_width_m);
+      if (err < best_err) {
+        best_err = err;
+        best_theta = t;
+        best_width = width;
+      }
+
+      if (have_prev &&
+          (prev_width - requested_width_m) * (width - requested_width_m) <= 0.0) {
+        double lo = prev_theta;
+        double hi = t;
+        double w_lo = prev_width;
+        double w_hi = width;
+        for (int iter = 0; iter < 40; ++iter) {
+          const double mid = 0.5 * (lo + hi);
+          double w_mid = 0.0;
+          if (!computeCarryWidth(mid, w_mid)) break;
+          if ((w_lo - requested_width_m) * (w_mid - requested_width_m) <= 0.0) {
+            hi = mid;
+            w_hi = w_mid;
+          } else {
+            lo = mid;
+            w_lo = w_mid;
+          }
+        }
+        const double candidate_theta = 0.5 * (lo + hi);
+        const double candidate_width = 0.5 * (w_lo + w_hi);
+        const double candidate_err = std::abs(candidate_width - requested_width_m);
+        if (candidate_err < best_err) {
+          best_err = candidate_err;
+          best_theta = candidate_theta;
+          best_width = candidate_width;
+        }
+      }
+
+      have_prev = true;
+      prev_theta = t;
+      prev_width = width;
+    }
+
+    if (best_err > kWidthTolerance) {
+      char buf[160];
+      snprintf(buf, sizeof(buf),
+               "width %.3fm cannot be solved within %.3fm tolerance",
+               requested_width_m, kWidthTolerance);
+      message = buf;
+      return false;
+    }
+
+    theta = best_theta;
+    actual_width_m = best_width;
+    return true;
+  }
+
+  bool makeJointTrajectoryGoal(MoveGroupInterfacePtr arm,
+                               const std::vector<double> & positions,
+                               double speed_scale,
+                               FollowJointTrajectory::Goal & goal,
+                               double & duration_s,
+                               const std::string & label,
+                               const std::string & command_name)
+  {
+    if (!arm) return false;
+    const auto * jmg =
+      arm->getRobotModel()->getJointModelGroup(arm->getName());
+    if (!jmg) return false;
+
+    const auto names = arm->getJointNames();
+    const auto current = arm->getCurrentJointValues();
+    if (positions.size() != names.size() || current.size() != positions.size()) {
+      RCLCPP_ERROR(get_logger(),
+                   "%s(%s): joint count mismatch (%zu positions, %zu names, %zu current)",
+                   command_name.c_str(), label.c_str(), positions.size(), names.size(),
+                   current.size());
+      return false;
+    }
+
+    goal.trajectory.joint_names = names;
+    trajectory_msgs::msg::JointTrajectoryPoint point;
+    point.positions = positions;
+    point.velocities.assign(positions.size(), 0.0);
+
+    const double clamped_speed = std::max(0.05, std::min(1.0, speed_scale));
+    duration_s = 0.0;
+    const auto & joint_models = jmg->getActiveJointModels();
+    for (size_t i = 0; i < positions.size() && i < current.size(); ++i) {
+      double max_vel = 1.0;
+      if (i < joint_models.size()) {
+        const auto & bounds = joint_models[i]->getVariableBounds();
+        if (!bounds.empty() && bounds[0].velocity_bounded_ &&
+            bounds[0].max_velocity_ > 1e-6) {
+          max_vel = bounds[0].max_velocity_;
+        }
+      }
+      duration_s = std::max(duration_s,
+                            std::abs(positions[i] - current[i]) / (max_vel * clamped_speed));
+    }
+    duration_s = std::max(0.5, duration_s);
+    point.time_from_start.sec = static_cast<int32_t>(duration_s);
+    point.time_from_start.nanosec =
+      static_cast<uint32_t>((duration_s - point.time_from_start.sec) * 1e9);
+    goal.trajectory.points.push_back(point);
+    return true;
+  }
+
   int executeBothHomeWithControllers(double speed_scale)
   {
     if (!left_arm_traj_client_->wait_for_action_server(std::chrono::seconds(2)) ||
@@ -928,6 +1268,119 @@ private:
     left_arm_->setStartStateToCurrentState();
     right_arm_->setStartStateToCurrentState();
     return err::OK;
+  }
+
+  int executeBothCarryWithControllers(double requested_width_m,
+                                      double speed_scale,
+                                      double & actual_width_m,
+                                      std::string & message)
+  {
+    if (!left_arm_traj_client_->wait_for_action_server(std::chrono::seconds(2)) ||
+        !right_arm_traj_client_->wait_for_action_server(std::chrono::seconds(2))) {
+      message = "carry_action: arm trajectory controller unavailable";
+      RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+      return err::EXECUTE_FAILED;
+    }
+
+    double theta = 0.0;
+    if (!solveCarryThetaForWidth(requested_width_m, theta, actual_width_m, message)) {
+      return err::BAD_REQUEST;
+    }
+
+    std::vector<double> left_positions;
+    std::vector<double> right_positions;
+    if (!makeCarryPositions(left_arm_, "left", theta, left_positions) ||
+        !makeCarryPositions(right_arm_, "right", theta, right_positions)) {
+      message = "carry_action: failed to build target joints";
+      return err::PLAN_FAILED;
+    }
+
+    FollowJointTrajectory::Goal left_goal;
+    FollowJointTrajectory::Goal right_goal;
+    double left_duration_s = 0.0;
+    double right_duration_s = 0.0;
+    if (!makeJointTrajectoryGoal(left_arm_, left_positions, speed_scale, left_goal,
+                                 left_duration_s, "left", "carry_action") ||
+        !makeJointTrajectoryGoal(right_arm_, right_positions, speed_scale, right_goal,
+                                 right_duration_s, "right", "carry_action")) {
+      message = "carry_action: failed to build trajectory goal";
+      return err::PLAN_FAILED;
+    }
+
+    const double sync_duration_s = std::max(left_duration_s, right_duration_s);
+    setTrajectoryDuration(left_goal, sync_duration_s);
+    setTrajectoryDuration(right_goal, sync_duration_s);
+
+    RCLCPP_INFO(get_logger(),
+                "carry_action: sending synchronized carry goals "
+                "(width=%.3fm theta=%.4frad left=%.2fs right=%.2fs sync=%.2fs speed=%.2f)",
+                actual_width_m, theta, left_duration_s, right_duration_s,
+                sync_duration_s, speed_scale);
+    auto left_goal_future = left_arm_traj_client_->async_send_goal(left_goal);
+    auto right_goal_future = right_arm_traj_client_->async_send_goal(right_goal);
+
+    if (left_goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready ||
+        right_goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+      message = "carry_action: timed out waiting for goal acceptance";
+      RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+      return err::EXECUTE_FAILED;
+    }
+
+    auto left_handle = left_goal_future.get();
+    auto right_handle = right_goal_future.get();
+    if (!left_handle || !right_handle) {
+      message = "carry_action: controller rejected carry goal";
+      RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+      return err::EXECUTE_FAILED;
+    }
+
+    auto left_result_future = left_arm_traj_client_->async_get_result(left_handle);
+    auto right_result_future = right_arm_traj_client_->async_get_result(right_handle);
+    const auto exec_timeout =
+      std::chrono::duration<double>(std::max(30.0, sync_duration_s + 5.0));
+    if (left_result_future.wait_for(exec_timeout) != std::future_status::ready ||
+        right_result_future.wait_for(exec_timeout) != std::future_status::ready) {
+      message = "carry_action: timed out waiting for execution result";
+      RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+      return err::EXECUTE_FAILED;
+    }
+
+    const auto left_wrapped = left_result_future.get();
+    const auto right_wrapped = right_result_future.get();
+    const bool left_ok =
+      left_wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+      left_wrapped.result &&
+      left_wrapped.result->error_code == FollowJointTrajectory::Result::SUCCESSFUL;
+    const bool right_ok =
+      right_wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+      right_wrapped.result &&
+      right_wrapped.result->error_code == FollowJointTrajectory::Result::SUCCESSFUL;
+    if (!left_ok || !right_ok) {
+      message = "carry_action: controller execution failed";
+      RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+      return err::EXECUTE_FAILED;
+    }
+
+    left_arm_->setStartStateToCurrentState();
+    right_arm_->setStartStateToCurrentState();
+    return err::OK;
+  }
+
+  bool carryGripperTarget(const std::string & gripper, double & target_m) const
+  {
+    if (gripper == "close") {
+      target_m = gripper_closed_pos_;
+      return true;
+    }
+    if (gripper == "open") {
+      target_m = gripper_open_pos_;
+      return true;
+    }
+    if (gripper == "half_close") {
+      target_m = gripper_half_pos_;
+      return true;
+    }
+    return false;
   }
 
   // True if any finger is still further away than `gripper_close_thresh_`
@@ -1445,6 +1898,58 @@ private:
     resp->message = (rc == err::OK) ? "home reached" : "go-home failed";
   }
 
+  void handleCarry(const std::shared_ptr<openarm_skills::srv::CarryAction::Request> req,
+                   std::shared_ptr<openarm_skills::srv::CarryAction::Response> resp)
+  {
+    if (stop_requested_.load() && !busy_.load()) {
+      stop_requested_.store(false);
+    }
+
+    double gripper_target = 0.0;
+    if (!carryGripperTarget(req->gripper, gripper_target)) {
+      resp->success = false;
+      resp->result_code = err::BAD_REQUEST;
+      resp->message = "gripper must be close|open|half_close";
+      resp->actual_width = 0.0;
+      return;
+    }
+
+    const double speed = (std::isfinite(req->speed_scale) && req->speed_scale > 0.0)
+      ? std::max(0.05, std::min(1.0, req->speed_scale))
+      : transport_speed_scale_;
+
+    double actual_width = 0.0;
+    std::string message;
+    int rc = executeBothCarryWithControllers(req->width, speed, actual_width, message);
+    if (rc == err::OK) {
+      rc = setGripper(left_grip_, "left", gripper_target, speed,
+                      false, 0.0, speed);
+      if (rc == err::OK) {
+        rc = setGripper(right_grip_, "right", gripper_target, speed,
+                        false, 0.0, speed);
+      }
+      if (rc != err::OK) {
+        message = "carry_action: gripper command failed";
+      }
+    }
+
+    if (rc == err::OK) {
+      stop_requested_.store(false);
+      char buf[160];
+      snprintf(buf, sizeof(buf),
+               "carry pose reached width=%.3fm gripper=%s",
+               actual_width, req->gripper.c_str());
+      message = buf;
+    } else if (message.empty()) {
+      message = "carry_action failed";
+    }
+
+    resp->result_code = rc;
+    resp->success = (rc == err::OK);
+    resp->message = message;
+    resp->actual_width = actual_width;
+  }
+
   void handleGripper(const std::shared_ptr<openarm_skills::srv::Gripper::Request> req,
                      std::shared_ptr<openarm_skills::srv::Gripper::Response> resp)
   {
@@ -1496,6 +2001,9 @@ private:
   double gripper_close_thresh_, gripper_max_force_, gripper_default_speed_;
   double workspace_radius_, min_z_, max_z_;
   double perception_timeout_s_;
+  double carry_joint4_rad_, carry_joint6_rad_, carry_joint7_rad_;
+  double carry_default_width_m_;
+  double carry_min_width_m_{0.0}, carry_max_width_m_{0.0};
 
   rclcpp::Node::SharedPtr mg_node_;
   MoveGroupInterfacePtr left_arm_, right_arm_, left_grip_, right_grip_;
@@ -1510,6 +2018,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr right_gripper_aux_pub_;
   rclcpp::Service<openarm_skills::srv::Stop>::SharedPtr stop_srv_;
   rclcpp::Service<openarm_skills::srv::GotoHome>::SharedPtr home_srv_;
+  rclcpp::Service<openarm_skills::srv::CarryAction>::SharedPtr carry_srv_;
   rclcpp::Service<openarm_skills::srv::Gripper>::SharedPtr gripper_srv_;
   rclcpp::Client<openarm_skills::srv::DetectGraspPose>::SharedPtr perception_client_;
 

@@ -1,0 +1,12 @@
+# Move both arms into a tray-carry pose.
+# width: desired lateral TCP-to-TCP width in metres; 0.0 uses the default width.
+# gripper: "close" | "open" | "half_close"
+# speed_scale: 0.0 ~ 1.0 (0 -> server default)
+float64 width
+string  gripper
+float64 speed_scale
+---
+bool    success
+int32   result_code
+string  message
+float64 actual_width
