@@ -31,20 +31,29 @@ run_svc() {
 }
 
 # --- 1. gripper: open / half_close / grasp / close ---
+'''
+注释说明爪子相关功能的各参数的意义：
+arm: 选择夹爪，left 或 right
+action: 夹爪动作；open=张开到 0.040m，half_close=半闭合到 0.020m，close=闭合到 0.0m，grasp=闭合抓取并检测是否夹住
+position: 可选夹爪指尖目标位置，单位米；>0 时覆盖 action 的默认位置，0 表示按 action 默认值执行
+force: 可选夹持力/保持强度；0 表示默认值，500g 塑料水瓶可从 6~10N 调试
+speed: 可选夹爪速度比例，0 表示默认值；0.1 较慢，0.9 较快
+
+'''
 run_svc "gripper open (left)" /openarm/gripper openarm_skills/srv/Gripper \
-  "{arm: 'left', action: 'open', position: 0.0, force: 0.0}"
+  "{arm: 'left', action: 'open', position: 0.0, force: 0.0, speed: 0.5}"
 
 run_svc "gripper half_close (left)" /openarm/gripper openarm_skills/srv/Gripper \
-  "{arm: 'left', action: 'half_close', position: 0.0, force: 0.0}"
+  "{arm: 'left', action: 'half_close', position: 0.0, force: 0.0, speed: 0.5}"
 
 run_svc "gripper grasp (left)" /openarm/gripper openarm_skills/srv/Gripper \
-  "{arm: 'left', action: 'grasp', position: 0.0, force: 0.0}"
+  "{arm: 'left', action: 'grasp', position: 0.0, force: 8.0, speed: 0.5}"
 
 run_svc "gripper close (right)" /openarm/gripper openarm_skills/srv/Gripper \
-  "{arm: 'right', action: 'close', position: 0.0, force: 0.0}"
+  "{arm: 'right', action: 'close', position: 0.0, force: 0.0, speed: 0.5}"
 
 run_svc "gripper open (right)" /openarm/gripper openarm_skills/srv/Gripper \
-  "{arm: 'right', action: 'open', position: 0.0, force: 0.0}"
+  "{arm: 'right', action: 'open', position: 0.0, force: 0.0, speed: 0.5}"
 
 # --- 2. goto_home ---
 run_svc "goto_home both" /openarm/goto_home openarm_skills/srv/GotoHome \

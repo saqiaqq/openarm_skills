@@ -28,10 +28,12 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
+#include <control_msgs/action/gripper_command.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/robot_state/robot_state.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 
 #include "openarm_skills/action/pick_place.hpp"
@@ -47,6 +49,7 @@ namespace openarm_skills
 using PickPlaceAction = openarm_skills::action::PickPlace;
 using PickPlaceGoalHandle = rclcpp_action::ServerGoalHandle<PickPlaceAction>;
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
+using GripperCommand = control_msgs::action::GripperCommand;
 using moveit::planning_interface::MoveGroupInterface;
 // Humble 版 MoveIt2 的 MoveGroupInterface 没有 SharedPtr typedef，手动补充
 using MoveGroupInterfacePtr = std::shared_ptr<MoveGroupInterface>;
@@ -98,6 +101,8 @@ public:
     gripper_half_pos_       = get("gripper_half_pos",   0.020);
     gripper_closed_pos_     = get("gripper_closed_pos", 0.0);
     gripper_close_thresh_   = get("gripper_close_threshold_m", 0.001);
+    gripper_max_force_      = get("gripper_max_force_n", 40.0);
+    gripper_default_speed_  = get("gripper_default_speed", 0.5);
 
     workspace_radius_       = get("workspace_radius_m", 1.20);
     min_z_                  = get("min_z_m", -0.10);
@@ -118,6 +123,14 @@ public:
     right_arm_traj_client_ = rclcpp_action::create_client<FollowJointTrajectory>(
       this, "/right_joint_trajectory_controller/follow_joint_trajectory",
       traj_callback_group_);
+    left_gripper_cmd_client_ = rclcpp_action::create_client<GripperCommand>(
+      this, "/left_gripper_controller/gripper_cmd", traj_callback_group_);
+    right_gripper_cmd_client_ = rclcpp_action::create_client<GripperCommand>(
+      this, "/right_gripper_controller/gripper_cmd", traj_callback_group_);
+    left_gripper_aux_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+      "/left_gripper_aux_controller/commands", 10);
+    right_gripper_aux_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+      "/right_gripper_aux_controller/commands", 10);
 
     // ---- service servers ---------------------------------------------------
     stop_srv_ = this->create_service<openarm_skills::srv::Stop>(
@@ -552,15 +565,126 @@ private:
     return err::PLAN_FAILED;
   }
 
-  // Drive a finger joint to `target` metres.  Uses the gripper MoveGroup
-  // (which is wired to the gripper controller through MoveIt).
+  rclcpp_action::Client<GripperCommand>::SharedPtr gripperCommandClient(
+      const std::string & arm) const
+  {
+    if (arm == "left") return left_gripper_cmd_client_;
+    if (arm == "right") return right_gripper_cmd_client_;
+    return nullptr;
+  }
+
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr gripperAuxPublisher(
+      const std::string & arm) const
+  {
+    if (arm == "left") return left_gripper_aux_pub_;
+    if (arm == "right") return right_gripper_aux_pub_;
+    return nullptr;
+  }
+
+  double normalizedGripperSpeed(double speed) const
+  {
+    const double requested = (std::isfinite(speed) && speed > 0.0)
+      ? speed
+      : gripper_default_speed_;
+    return std::max(0.05, std::min(1.0, requested));
+  }
+
+  double normalizedGripperForce(double force) const
+  {
+    if (!std::isfinite(force) || force <= 0.0) return 0.0;
+    return std::min(force, gripper_max_force_);
+  }
+
+  void publishGripperAuxCommand(const std::string & arm,
+                                double speed,
+                                double force)
+  {
+    auto pub = gripperAuxPublisher(arm);
+    if (!pub) return;
+    std_msgs::msg::Float64MultiArray msg;
+    msg.data = {normalizedGripperSpeed(speed), normalizedGripperForce(force)};
+    pub->publish(msg);
+    RCLCPP_INFO(get_logger(), "gripper(%s): aux speed=%.2f force=%.2f",
+                arm.c_str(), msg.data[0], msg.data[1]);
+  }
+
+  int sendGripperCommand(const std::string & arm,
+                         double target_m,
+                         double max_effort,
+                         double speed,
+                         bool compliance_grasp,
+                         MoveGroupInterfacePtr grip)
+  {
+    auto client = gripperCommandClient(arm);
+    if (!client) return err::BAD_REQUEST;
+    if (!client->wait_for_action_server(std::chrono::seconds(2))) {
+      RCLCPP_ERROR(get_logger(), "gripper(%s): action server unavailable", arm.c_str());
+      return err::ACTION_TIMEOUT;
+    }
+
+    GripperCommand::Goal goal;
+    goal.command.position = target_m;
+    goal.command.max_effort = max_effort;
+    publishGripperAuxCommand(arm, speed, max_effort);
+
+    RCLCPP_INFO(get_logger(),
+                "gripper(%s): target=%.4fm max_effort=%.2f speed=%.2f",
+                arm.c_str(), target_m, max_effort, normalizedGripperSpeed(speed));
+    auto goal_future = client->async_send_goal(goal);
+    if (goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+      RCLCPP_ERROR(get_logger(), "gripper(%s): timed out waiting for goal acceptance",
+                   arm.c_str());
+      return err::ACTION_TIMEOUT;
+    }
+
+    auto goal_handle = goal_future.get();
+    if (!goal_handle) {
+      RCLCPP_ERROR(get_logger(), "gripper(%s): goal rejected", arm.c_str());
+      return err::EXECUTE_FAILED;
+    }
+
+    auto result_future = client->async_get_result(goal_handle);
+    const auto timeout = std::chrono::duration<double>(std::max(1.0, step_timeout_s_));
+    if (result_future.wait_for(timeout) != std::future_status::ready) {
+      RCLCPP_ERROR(get_logger(), "gripper(%s): timed out waiting for result", arm.c_str());
+      return err::ACTION_TIMEOUT;
+    }
+
+    const auto wrapped = result_future.get();
+    if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED && wrapped.result) {
+      const bool ok = wrapped.result->reached_goal || wrapped.result->stalled ||
+                      (compliance_grasp && isGripped(grip));
+      if (ok) return err::OK;
+    }
+    if (compliance_grasp && isGripped(grip)) {
+      return err::OK;
+    }
+
+    RCLCPP_ERROR(get_logger(), "gripper(%s): controller reported failure", arm.c_str());
+    return err::EXECUTE_FAILED;
+  }
+
+  // Drive a finger joint to `target` metres.  With force > 0, send the
+  // controller's GripperCommand action directly so max_effort is preserved.
+  // Otherwise use the existing MoveIt position path.
   // compliance_grasp: close until contact; success if finger stalls with object held
   // (hardware layer switches to low-KP hold in openarm_hardware).
   int setGripper(MoveGroupInterfacePtr grip,
+                 const std::string & arm,
                  double target_m, double speed_scale,
-                 bool compliance_grasp = false)
+                 bool compliance_grasp = false,
+                 double force = 0.0,
+                 double gripper_speed = 0.0)
   {
     if (stop_requested_.load()) return err::STOPPED_BY_USER;
+    const double max_effort = normalizedGripperForce(force);
+    (void)speed_scale;
+    const double speed = normalizedGripperSpeed(gripper_speed);
+    if (max_effort > 0.0 || gripper_speed > 0.0) {
+      return sendGripperCommand(arm, target_m, max_effort, speed, compliance_grasp, grip);
+    }
+
+    publishGripperAuxCommand(arm, speed, max_effort);
     grip->setMaxVelocityScalingFactor(speed_scale);
     grip->setMaxAccelerationScalingFactor(speed_scale);
 
@@ -877,6 +1001,8 @@ private:
   int doPick(const std::string & arm,
              const geometry_msgs::msg::Pose & grasp,
              double approach, double retreat, double speed,
+             double gripper_force,
+             double gripper_speed,
              const std::shared_ptr<PickPlaceGoalHandle> & gh)
   {
     auto a = armGroup(arm); auto g = gripGroup(arm);
@@ -907,7 +1033,8 @@ private:
     if (!isGripperOpen(g)) {
       publishFb(gh, "grasping", "pick.open_gripper", 0.40,
                 "opening gripper at hover");
-      const int og = setGripper(g, gripper_open_pos_, speed);
+      const int og = setGripper(g, arm, gripper_open_pos_, speed,
+                                false, 0.0, gripper_speed);
       if (og) {
         RCLCPP_WARN(get_logger(),
                     "pick.open_gripper failed (rc=%d), continuing anyway", og);
@@ -935,7 +1062,8 @@ private:
     if (rc) return rc;
 
     publishFb(gh, "grasping", "pick.close_gripper", 0.55, "grasping object");
-    rc = setGripper(g, gripper_closed_pos_, speed, true);
+    rc = setGripper(g, arm, gripper_closed_pos_, speed, true,
+                    gripper_force, gripper_speed);
     if (rc) return rc;
 
     if (!isGripped(g)) {
@@ -955,10 +1083,12 @@ private:
         for (int i = 0; i < grasp_retry_count_ && !isGripped(g); ++i) {
           rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift");
           if (rc) jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift.jnt");
-          setGripper(g, gripper_open_pos_, speed);
+          setGripper(g, arm, gripper_open_pos_, speed,
+                     false, 0.0, gripper_speed);
           rc = linearMoveTo(a, grasp, speed, "pick.retry_descend");
           if (rc) jointMoveTo(a, grasp, speed, "pick.retry_descend.jnt");
-          setGripper(g, gripper_closed_pos_, speed, true);
+          setGripper(g, arm, gripper_closed_pos_, speed, true,
+                     gripper_force, gripper_speed);
         }
         if (!isGripped(g)) return err::GRIP_NOT_HELD;
       }
@@ -1010,7 +1140,7 @@ private:
     if (rc) return rc;
 
     publishFb(gh, "placing", "place.open_gripper", 0.92, "opening gripper");
-    rc = setGripper(g, gripper_open_pos_, speed);
+    rc = setGripper(g, arm, gripper_open_pos_, speed);
     if (rc) return rc;
 
     publishFb(gh, "placing", "place.retreat", 0.97, "lifting away");
@@ -1065,7 +1195,7 @@ private:
 
     publishFb(gh, "returning", "return.restore_gripper", 0.995,
               "restoring gripper state");
-    rc = setGripper(g, start_gripper_target, speed);
+    rc = setGripper(g, arm, start_gripper_target, speed);
     if (rc) {
       last_failure_phase_ = "return.restore_gripper";
       last_failure_reason_ = "failed to restore initial gripper state";
@@ -1137,6 +1267,8 @@ private:
                                                         : retreat_offset_m_;
     const double speed    = goal->speed_scale > 0 ? goal->speed_scale
                                                   : default_speed_scale_;
+    const double gripper_force = normalizedGripperForce(goal->gripper_force);
+    const double gripper_speed = normalizedGripperSpeed(goal->gripper_speed);
 
     auto start_arm = armGroup(goal->arm);
     auto start_grip = gripGroup(goal->arm);
@@ -1181,7 +1313,8 @@ private:
       return finish(gh, result, err::BAD_REQUEST, "grasp_pose outside workspace");
     }
 
-    int rc = doPick(goal->arm, grasp, approach, retreat, speed, gh);
+    int rc = doPick(goal->arm, grasp, approach, retreat, speed,
+                    gripper_force, gripper_speed, gh);
     if (rc) return finish(gh, result, rc, "pick failed");
 
     publishFb(gh, "transporting", "transport", 0.72, "moving to place region");
@@ -1337,7 +1470,8 @@ private:
       compliance_grasp = true;
     } else if (req->action == "open")        target = gripper_open_pos_;
 
-    int rc = setGripper(g, target, default_speed_scale_, compliance_grasp);
+    int rc = setGripper(g, req->arm, target, default_speed_scale_,
+                        compliance_grasp, req->force, req->speed);
     resp->result_code = rc;
     resp->success = (rc == err::OK);
     resp->message = (rc == err::OK) ? "gripper command done" : "gripper failed";
@@ -1359,7 +1493,7 @@ private:
   int    plan_retry_count_, grasp_retry_count_;
   bool   debug_assume_grasp_success_;
   double gripper_open_pos_, gripper_half_pos_, gripper_closed_pos_;
-  double gripper_close_thresh_;
+  double gripper_close_thresh_, gripper_max_force_, gripper_default_speed_;
   double workspace_radius_, min_z_, max_z_;
   double perception_timeout_s_;
 
@@ -1370,6 +1504,10 @@ private:
   rclcpp_action::Server<PickPlaceAction>::SharedPtr pick_place_server_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr left_arm_traj_client_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr right_arm_traj_client_;
+  rclcpp_action::Client<GripperCommand>::SharedPtr left_gripper_cmd_client_;
+  rclcpp_action::Client<GripperCommand>::SharedPtr right_gripper_cmd_client_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr left_gripper_aux_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr right_gripper_aux_pub_;
   rclcpp::Service<openarm_skills::srv::Stop>::SharedPtr stop_srv_;
   rclcpp::Service<openarm_skills::srv::GotoHome>::SharedPtr home_srv_;
   rclcpp::Service<openarm_skills::srv::Gripper>::SharedPtr gripper_srv_;

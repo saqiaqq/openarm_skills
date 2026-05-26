@@ -49,6 +49,8 @@ skill_server:
     gripper_half_pos: 0.020
     gripper_closed_pos: 0.0
     gripper_close_threshold_m: 0.001  # below this finger position => "not gripped"
+    gripper_max_force_n: 40.0          # clamp requested force/max_effort; 0 means controller default
+    gripper_default_speed: 0.5         # default gripper speed scale used when request speed is 0
 
     # ------------------------------------------------------------------
     # Workspace safety bounds in base frame (rough sphere check)

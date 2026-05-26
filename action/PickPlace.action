@@ -13,6 +13,8 @@ geometry_msgs/Pose place_pose   # Used when pose_source == upper_computer (else 
 float64 approach_offset_m   # Pre-grasp / pre-place stand-off height (default 0.05)
 float64 retreat_offset_m    # Lift height after grasp / release (default 0.05)
 float64 speed_scale         # Velocity scaling for the slow phases (0.0 ~ 1.0)
+float64 gripper_force       # Gripper force/hold strength during grasp; 0 = controller default
+float64 gripper_speed       # Gripper speed scale during grasp; 0 = default
 float64 timeout_s           # 0 = use server default
 ---
 # Result ------------------------------------------------------------

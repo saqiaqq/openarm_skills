@@ -2,7 +2,8 @@
 string  arm        # "left" | "right"
 string  action     # "open" | "close" | "half_close" | "grasp"
 float64 position   # Optional explicit finger position in metres (>0 overrides action)
-float64 force      # Reserved (ignored by simple position controllers)
+float64 force      # Optional gripper force/hold strength; 0 = controller default
+float64 speed      # Optional gripper speed scale; 0 = default, smaller is slower
 ---
 bool   success
 int32  result_code
