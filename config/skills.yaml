@@ -20,7 +20,16 @@ skill_server:
     default_speed_scale: 0.10        # for pre-grasp / descent / lift / release
     transport_speed_scale: 0.30      # higher speed when carrying between points
     cartesian_eef_step_m: 0.005
-    cartesian_jump_threshold: 0.0
+    # Joint-space jump threshold for computeCartesianPath.
+    # 0.0 = disabled (dangerous: allows silent 2π IK flips between waypoints,
+    # which cause "wild rotation" even when fraction=100%).
+    # 1.0 = any joint changing > 1 rad between consecutive 5mm waypoints is
+    # rejected. At 5mm step in a well-conditioned configuration, adjacent IK
+    # solutions differ by < 0.1 rad; 1.0 catches IK branch flips (typically
+    # 2-π rad) and elbow flips (typically ~2 rad). The old 5.0 value let a
+    # full branch flip pass undetected, causing the arm to swing wildly during
+    # an otherwise "frac=1.00" descent.
+    cartesian_jump_threshold: 1.0
     cartesian_min_fraction: 0.95     # < threshold -> treat as plan failure
     approach_offset_m: 0.05
     retreat_offset_m: 0.05

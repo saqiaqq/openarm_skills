@@ -55,6 +55,121 @@ run_svc "stop" /openarm/stop openarm_skills/srv/Stop \
   "{cmd_id: 'test-stop-001'}"
 
 # --- 4. pick_place (short timeout; adjust poses for your cell) ---
+
+'''
+cmd_id: 本次命令 ID，用于区分请求，例如 test-pp-001
+arm: 使用哪只手臂，left 或 right
+pose_source: 位姿来源，upper_computer 表示直接使用命令里的位姿，camera 表示由相机识别
+target_name: pose_source: camera 时使用的目标名称，例如 cup
+target_index: 同名目标有多个时用于选择第几个
+grasp_pose: 抓取位姿，upper_computer 模式下有效
+place_pose: 放置位姿，upper_computer 模式下有效
+position.x/y/z: 目标位置，单位米，基于机器人 base frame
+orientation.x/y/z/w: 四元数姿态
+approach_offset_m: 抓取/放置前的接近偏移距离，单位米
+retreat_offset_m: 抓取后/放置后的抬升退出距离，单位米
+speed_scale: 速度比例，范围通常 0.0 ~ 1.0
+timeout_s: 超时时间，单位秒；0 表示使用服务默认值
+
+常用四元素对照表（openarm 零位时 TCP 的「approach 轴」= 本体 +Z，即朝上）：
+
+四元数 (x,y,z,w) 通过绕 Y 轴旋转 θ，把 TCP approach 轴从 +Z 旋到目标方向：
+
+姿态                                                    x       y       z       w         approach 指向     palm 朝向
+默认 / identity                                          0       0       0       1.0       +Z（朝上）         +X
+绕Y轴 90°（水平向前，背朝上）                            0       0.7071  0       0.7071    +X（水平向前）     -Z（朝下）
+★ 水平向前 + palm 朝上（90°绕Y + 180°滚转 approach 轴）  0.7071  0       0.7071  0         +X（水平向前）     +Z（朝上）✅
+绕Y轴 180°（垂直向下，背朝 +X）                          0       1       0       0         -Z（朝下）         +X 或 -X（看滚转）
+绕Y轴 -90°（水平向后）                                   0      -0.7071  0       0.7071    -X（水平向后）     多在身后才有意义
+绕Z轴 90°（沿 +Z 旋转，配合俯仰使用）                    0       0       0.7071  0.7071    approach 轴不变   一般与上面组合
+
+提示：同一 approach 方向上还可以"沿 approach 轴滚转 180°"得到等价 IK 解（手腕 joint7 ±π），
+靠四元数选择 palm 朝向哪边。先决定 approach 方向（绕 Y 角度），再决定 palm 朝向
+（是否在 X、Z 两个分量上加同号 0.7071）。
+
+注意（已经过实测验证）：identity (0,0,0,1) 并不是「TCP 垂直向下」。openarm 在 home
+位姿（所有关节=0）时 TCP 的 approach 方向沿本体 +Z 朝上。要做桌面物体的顶部抓取，
+用 ★ 行的 (0,1,0,0)。先前 (0,0.7071,0,0.7071) 给出的是「水平向前」抓取（如下图 1
+所示），不是垂直向下；本表已更正。
+
+            案例1（推荐：垂直向下抓取，TCP 朝下 = 绕Y轴 180°）：
+            ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace \
+            "{cmd_id: 'test-pp-003', arm: 'right', pose_source: 'upper_computer',
+              target_name: '', target_index: 0,
+              grasp_pose: {position: {x: 0.28, y: -0.18, z: 0.28},
+                          orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}},
+              place_pose: {position: {x: 0.28, y: -0.28, z: 0.28},
+                          orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}},
+              approach_offset_m: 0.05, retreat_offset_m: 0.05,
+              speed_scale: 0.10, timeout_s: 120.0}" --feedback
+
+            案例1b（水平向前抓取，approach 沿 +X，背部朝上 —— 一般不推荐，因为手抓"背朝天"）：
+            ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace \
+            "{cmd_id: 'test-pp-003', arm: 'right', pose_source: 'upper_computer',
+              target_name: '', target_index: 0,
+              grasp_pose: {position: {x: 0.28, y: -0.18, z: 0.28},
+                          orientation: {x: 0.0, y: 0.7071, z: 0.0, w: 0.7071}},
+              place_pose: {position: {x: 0.28, y: -0.28, z: 0.28},
+                          orientation: {x: 0.0, y: 0.7071, z: 0.0, w: 0.7071}},
+              approach_offset_m: 0.05, retreat_offset_m: 0.05,
+              speed_scale: 0.10, timeout_s: 120.0}" --feedback
+
+案例1c（水平向前抓取，approach 沿 +X，★ palm 朝上，更接近"人手手心向上"姿态）：
+  说明：这是在案例1b基础上沿 approach 轴再滚转 180°（让夹爪的 palm 面翻上来）。
+  四元数 = (0,0.7071,0,0.7071) ⊗ 绕局部Z 180°的滚转  = (0.7071, 0, 0.7071, 0)
+ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace \
+"{cmd_id: 'test-pp-003', arm: 'right', pose_source: 'upper_computer',
+  target_name: '', target_index: 0,
+  grasp_pose: {position: {x: 0.28, y: -0.18, z: 0.28},
+               orientation: {x: 0.7071, y: 0.0, z: 0.7071, w: 0.0}},
+  place_pose: {position: {x: 0.28, y: -0.28, z: 0.28},
+               orientation: {x: 0.7071, y: 0.0, z: 0.7071, w: 0.0}},
+  approach_offset_m: 0.05, retreat_offset_m: 0.05,
+  speed_scale: 0.10, timeout_s: 120.0}" --feedback
+
+案例1d（推荐：垂直向下抓取，TCP 朝下 = 绕Y轴 180°）：
+ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace \
+"{cmd_id: 'test-pp-003', arm: 'right', pose_source: 'upper_computer',
+  target_name: '', target_index: 0,
+  grasp_pose: {position: {x: 0.28, y: -0.18, z: 0.28},
+              orientation: {x: 1.0, y: 0.0, z: 0.0, w: 0.0}},
+  place_pose: {position: {x: 0.28, y: -0.28, z: 0.28},
+              orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}},
+  approach_offset_m: 0.05, retreat_offset_m: 0.05,
+  speed_scale: 0.10, timeout_s: 120.0}" --feedback
+
+案例2：
+ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace "{cmd_id: 'test-pp-003', arm: 'right', pose_source: 'upper_computer',
+  target_name: '', target_index: 0,
+  grasp_pose: {position: {x: 0.28, y: -0.18, z: 0.28},
+               orientation: {x: 0.0, y: 0.3827, z: 0.0, w: 0.9239}},
+  place_pose: {position: {x: 0.28, y: -0.28, z: 0.28},
+               orientation: {x: 0.0, y: 0.7071, z: 0.0, w: 0.7071}},
+  approach_offset_m: 0.05, retreat_offset_m: 0.05,
+  speed_scale: 0.10, timeout_s: 120.0}" --feedback
+
+
+Feedback: status: perceiving / phase: pick.detect          ← 解析抓取位姿（upper_computer模式直接跳过）
+Feedback: status: grasping  / phase: pick.approach         ← Pilz PTP 运动到悬停点（grasp+0.05m），全程不动夹爪
+Feedback: status: grasping  / phase: pick.open_gripper     ← 到达悬停点后，仅当爪子非「张开」状态才张开；已张开则跳过此阶段
+Feedback: status: grasping  / phase: pick.descend          ← 笛卡尔直线下降到grasp点（爪子已张开）
+Feedback: status: grasping  / phase: pick.close_gripper    ← 闭合夹爪抓取物体
+Result:   success: false / result_code: 1003         ← GRIP_NOT_HELD：夹爪关闭但检测到没夹住物体
+          message: pick failed at pick.close_gripper
+
+常见错误码 (result_code) 与 message 示例：
+  1001 PLAN_FAILED   "pick failed at pick.approach: IK unreachable (pose not solvable)"
+                    → grasp_pose 不可达，常因姿态四元数错误（如用 identity 而非 ★ 行）
+  1001 PLAN_FAILED   "pick failed at pick.descend: cartesian fraction below threshold"
+                    → 笛卡尔下降被几何/奇异性阻挡
+  1003 GRIP_NOT_HELD "pick failed at pick.close_gripper"
+                    → 夹爪关闭但没夹到物体
+  1004 EXECUTE_FAILED → 控制器执行失败（运动学没问题，硬件层面）
+  2003 CAMERA_OUT_OF_RANGE "grasp_pose outside workspace"
+                    → 位置在 workspace 球外（半径 1.2m）或 z 越界
+
+
+'''
 echo ""
 echo ">>> pick_place (right arm, upper_computer poses — edit script if needed)"
 ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace \

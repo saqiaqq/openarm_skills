@@ -19,7 +19,6 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,7 +27,7 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
-#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit/robot_state/robot_state.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 
 #include "openarm_skills/action/pick_place.hpp"
@@ -75,7 +74,12 @@ public:
     default_speed_scale_    = get("default_speed_scale",   0.10);
     transport_speed_scale_  = get("transport_speed_scale", 0.30);
     cartesian_eef_step_     = get("cartesian_eef_step_m",  0.005);
-    cartesian_jump_thresh_  = get("cartesian_jump_threshold", 0.0);
+    // 5mm step + well-conditioned arm → adjacent IK solutions differ by < 0.1 rad.
+    // A threshold of 1.0 rad per step catches IK branch flips (~2+ rad) while
+    // tolerating mild near-singularity variations.  The old 5.0 rad value
+    // allowed a full branch flip to go undetected, causing the Cartesian
+    // trajectory to silently include huge intermediate joint excursions.
+    cartesian_jump_thresh_  = get("cartesian_jump_threshold", 1.0);
     cartesian_min_fraction_ = get("cartesian_min_fraction", 0.95);
     approach_offset_m_      = get("approach_offset_m", 0.05);
     retreat_offset_m_       = get("retreat_offset_m",  0.05);
@@ -190,6 +194,156 @@ public:
                  p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w);
   }
 
+  // Normalize a quaternion in-place; return true if correction was needed.
+  // An un-normalized quaternion passed to IK produces a garbled rotation
+  // target and causes wild, unpredictable arm motions.
+  static bool normalizeQuat(geometry_msgs::msg::Pose & pose, const std::string & tag,
+                             rclcpp::Logger logger)
+  {
+    auto & q = pose.orientation;
+    const double n = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (n < 1e-6) {
+      RCLCPP_WARN(logger, "[%s] quaternion magnitude ~0, reset to identity", tag.c_str());
+      q.x = 0; q.y = 0; q.z = 0; q.w = 1;
+      return true;
+    }
+    if (std::abs(n - 1.0) > 1e-3) {
+      RCLCPP_WARN(logger,
+                  "[%s] quaternion not unit (|q|=%.4f), normalizing "
+                  "[%.4f, %.4f, %.4f, %.4f] → "
+                  "[%.4f, %.4f, %.4f, %.4f]",
+                  tag.c_str(), n,
+                  q.x, q.y, q.z, q.w,
+                  q.x/n, q.y/n, q.z/n, q.w/n);
+      q.x /= n; q.y /= n; q.z /= n; q.w /= n;
+      return true;
+    }
+    return false;
+  }
+
+  // Apply ±2π wrap to each joint in `sol` so that travel from `current` is
+  // minimised.  Works on a solution vector in-place; returns true if any joint
+  // was changed.  Only accepts a wrap if the candidate stays within joint bounds.
+  bool wrapSolution(const moveit::core::JointModelGroup * jmg,
+                    const std::vector<double> & current,
+                    std::vector<double> & sol) const
+  {
+    if (current.size() != sol.size()) return false;
+    bool changed = false;
+    const auto & joints = jmg->getActiveJointModels();
+    for (size_t i = 0; i < sol.size(); ++i) {
+      double diff = sol[i] - current[i];
+      double candidate = 0.0;
+      if (diff > M_PI)        candidate = sol[i] - 2 * M_PI;
+      else if (diff < -M_PI)  candidate = sol[i] + 2 * M_PI;
+      else continue;
+
+      const auto & bounds = joints[i]->getVariableBounds();
+      if (bounds.empty() || !bounds[0].position_bounded_ ||
+          (candidate >= bounds[0].min_position_ &&
+           candidate <= bounds[0].max_position_)) {
+        sol[i] = candidate;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  // Solve IK for `target_pose` using multiple seeds and return the joint
+  // solution with minimum total travel from `current_joints`.
+  //
+  // Why: KDL IK is seed-sensitive and from some configurations (e.g. home =
+  // all-zeros) it converges to the wrong IK branch (elbow-up vs elbow-down).
+  // Trying several seeds (current state first, then random) and selecting the
+  // minimum-travel solution reliably finds the kinematically nearest branch.
+  //
+  // Returns true and populates `best_joints` if at least one seed succeeded.
+  bool solveIkBestBranch(MoveGroupInterfacePtr arm,
+                          const geometry_msgs::msg::Pose & target_pose,
+                          const std::vector<double> & current_joints,
+                          int n_seeds,
+                          std::vector<double> & best_joints,
+                          const std::string & phase)
+  {
+    const auto * jmg =
+      arm->getRobotModel()->getJointModelGroup(arm->getName());
+    if (!jmg) return false;
+
+    const std::string eef = arm->getEndEffectorLink();
+    auto robot_model = arm->getRobotModel();
+
+    double best_travel = std::numeric_limits<double>::max();
+    int n_ok = 0;
+
+    for (int attempt = 0; attempt < n_seeds; ++attempt) {
+      moveit::core::RobotState rs(robot_model);
+      if (attempt == 0) {
+        // Seed from the actual current configuration: most likely to land on
+        // the nearest IK branch.
+        if (current_joints.size() == jmg->getVariableCount())
+          rs.setJointGroupPositions(jmg, current_joints);
+        else
+          rs.setToDefaultValues();
+      } else {
+        rs.setToRandomPositions(jmg);
+      }
+      rs.update();
+
+      if (!rs.setFromIK(jmg, target_pose, eef, 0.05 /* s per seed */)) continue;
+      ++n_ok;
+
+      std::vector<double> sol(jmg->getVariableCount());
+      rs.copyJointGroupPositions(jmg, sol);
+
+      // Apply ±2π wrap before computing travel.
+      wrapSolution(jmg, current_joints, sol);
+
+      double travel = 0.0;
+      for (size_t j = 0; j < sol.size() && j < current_joints.size(); ++j)
+        travel += std::abs(sol[j] - current_joints[j]);
+
+      if (travel < best_travel) {
+        best_travel = travel;
+        best_joints = sol;
+      }
+      // Early exit: travel < 1 rad/joint is clearly the nearest branch.
+      if (best_travel < static_cast<double>(jmg->getVariableCount())) break;
+    }
+
+    if (n_ok > 0) {
+      RCLCPP_INFO(get_logger(),
+                  "[%s] IK: %d/%d seeds succeeded, best branch Δjoints=%.3f rad",
+                  phase.c_str(), n_ok, n_seeds, best_travel);
+    } else {
+      RCLCPP_WARN(get_logger(), "[%s] IK: all %d seeds failed", phase.c_str(), n_seeds);
+    }
+    return n_ok > 0;
+  }
+
+  // Log the joint names/values at the end-point of a planned trajectory.
+  void logIkResult(const moveit::planning_interface::MoveGroupInterface::Plan & plan,
+                   const std::string & phase, const std::string & planner)
+  {
+    const auto & jt = plan.trajectory_.joint_trajectory;
+    if (jt.points.empty()) return;
+
+    const auto & last = jt.points.back();
+    const double dur =
+      last.time_from_start.sec + last.time_from_start.nanosec * 1e-9;
+
+    std::string jvals;
+    for (size_t i = 0; i < jt.joint_names.size() && i < last.positions.size(); ++i) {
+      char buf[48];
+      snprintf(buf, sizeof(buf), "%s:%.3f",
+               jt.joint_names[i].c_str(), last.positions[i]);
+      jvals += buf;
+      if (i + 1 < jt.joint_names.size()) jvals += ' ';
+    }
+    RCLCPP_INFO(get_logger(),
+                "[%s][%s] IK goal joints (dur=%.2fs): [%s]",
+                phase.c_str(), planner.c_str(), dur, jvals.c_str());
+  }
+
   rclcpp::Node::SharedPtr mgNode() { return mg_node_; }
 
 private:
@@ -230,6 +384,11 @@ private:
     arm->setMaxVelocityScalingFactor(speed_scale);
     arm->setMaxAccelerationScalingFactor(speed_scale);
     arm->setPlanningTime(planning_time_s_);
+    // Sync start state so computeCartesianPath seeds IK from the actual
+    // post-execution joint configuration, not a cached pre-motion state.
+    // Without this, after stop()+goto_home() the Cartesian IK may diverge and
+    // trigger the jump-threshold, causing erratic descent behaviour.
+    arm->setStartStateToCurrentState();
 
     std::vector<geometry_msgs::msg::Pose> waypoints{target};
     moveit_msgs::msg::RobotTrajectory traj;
@@ -241,13 +400,61 @@ private:
         waypoints, cartesian_eef_step_, cartesian_jump_thresh_, traj);
       if (fraction >= cartesian_min_fraction_) break;
       RCLCPP_WARN(get_logger(),
-                  "[%s] cartesian plan fraction=%.2f, retrying...", phase.c_str(), fraction);
+                  "[%s] cartesian plan fraction=%.2f (jump_thresh=%.1f), retrying...",
+                  phase.c_str(), fraction, cartesian_jump_thresh_);
     }
     if (fraction < cartesian_min_fraction_) {
-      RCLCPP_ERROR(get_logger(), "[%s] cartesian plan FAILED (frac=%.2f)",
-                   phase.c_str(), fraction);
+      RCLCPP_WARN(get_logger(),
+                  "[%s] cartesian FAILED (frac=%.2f, jump_thresh=%.1f) → "
+                  "falling back to joint-space",
+                  phase.c_str(), fraction, cartesian_jump_thresh_);
+      last_failure_phase_ = phase;
+      last_failure_reason_ = "cartesian fraction below threshold";
       return err::PLAN_FAILED;
     }
+    RCLCPP_INFO(get_logger(), "[%s] cartesian OK (frac=%.2f, %zu pts)",
+                phase.c_str(), fraction,
+                traj.joint_trajectory.points.size());
+
+    // Diagnostic: scan the planned trajectory for any large joint jump between
+    // adjacent waypoints.  computeCartesianPath only checks jump_threshold on
+    // the *raw* IK waypoints; after time-parameterization the trajectory still
+    // contains those same joint values (interpolated), so a real discontinuity
+    // will show up here as a large per-step delta.
+    {
+      const auto & pts = traj.joint_trajectory.points;
+      double max_jump = 0.0;
+      size_t max_jump_idx = 0;
+      int max_jump_joint = -1;
+      for (size_t i = 1; i < pts.size(); ++i) {
+        for (size_t j = 0; j < pts[i].positions.size() &&
+                            j < pts[i - 1].positions.size(); ++j) {
+          double d = std::abs(pts[i].positions[j] - pts[i - 1].positions[j]);
+          if (d > max_jump) {
+            max_jump = d;
+            max_jump_idx = i;
+            max_jump_joint = static_cast<int>(j);
+          }
+        }
+      }
+      RCLCPP_INFO(get_logger(),
+                  "[%s] cartesian max joint jump=%.4f rad (joint %d at pt %zu/%zu)",
+                  phase.c_str(), max_jump, max_jump_joint,
+                  max_jump_idx, pts.size());
+      // If we somehow still passed planning but a > 0.5 rad jump exists between
+      // adjacent (sub-mm-spaced) waypoints, refuse to execute — that path
+      // would whip the arm at full controller speed and is unsafe.
+      if (max_jump > 0.5) {
+        RCLCPP_ERROR(get_logger(),
+                     "[%s] REFUSING execute: %.3f rad joint jump between adjacent "
+                     "trajectory points indicates IK discontinuity",
+                     phase.c_str(), max_jump);
+        last_failure_phase_ = phase;
+        last_failure_reason_ = "IK discontinuity in cartesian trajectory";
+        return err::PLAN_FAILED;
+      }
+    }
+
     auto rc = arm->execute(traj);
     if (rc != moveit::core::MoveItErrorCode::SUCCESS) {
       RCLCPP_ERROR(get_logger(), "[%s] execute FAILED (code=%d)",
@@ -270,28 +477,33 @@ private:
     arm->setMaxVelocityScalingFactor(speed_scale);
     arm->setMaxAccelerationScalingFactor(speed_scale);
     arm->setPlanningTime(planning_time_s_);
-    // Explicitly sync start state so the IK seed equals the true current
-    // joint configuration.  This prevents KDL from wandering to a distant
-    // but pose-equivalent IK solution (the "full-revolution" problem).
+    // Sync start state so planning starts from the actual robot position.
     arm->setStartStateToCurrentState();
+    const std::vector<double> seed = arm->getCurrentJointValues();
 
-    const std::string eef = arm->getEndEffectorLink();
-    // setJointValueTarget(pose, eef) solves IK immediately using current
-    // state as seed and stores the resulting joint angles as the goal.
-    // This is more consistent than setPoseTarget() which defers IK to
-    // planning time and may pick a different seed.
-    if (!arm->setJointValueTarget(target, eef)) {
-      RCLCPP_WARN(get_logger(),
-                  "[%s] IK via setJointValueTarget failed for '%s', "
-                  "falling back to setPoseTarget",
-                  phase.c_str(), eef.c_str());
-      if (!arm->setPoseTarget(target, eef)) {
-        RCLCPP_ERROR(get_logger(), "[%s] IK failed for link '%s'",
-                     phase.c_str(), eef.c_str());
-        logTargetPose(get_logger(), phase, target);
-        return err::PLAN_FAILED;
-      }
+    // Multi-seed IK: try `seed` (current state) first, then random seeds, and
+    // pick the solution with minimum joint travel.  This prevents KDL from
+    // landing on the wrong IK branch (e.g. elbow-up vs elbow-down) when the
+    // robot is at a configuration (like home = all-zeros) that biases toward a
+    // distant branch.  A single-seed call via setJointValueTarget(pose, eef)
+    // is unreliable because it always seeds from the last stored goal state.
+    std::vector<double> ik_joints;
+    const int kIkSeeds = 10;
+    if (!solveIkBestBranch(arm, target, seed, kIkSeeds, ik_joints, phase)) {
+      // Fail fast: if 10 seeded IK attempts all fail, the target pose is
+      // unreachable.  Falling back to setPoseTarget() would only defer the
+      // same IK failure to the planner, wasting ~45 s of PTP+RRTConnect
+      // retries before giving the user the same answer.
+      RCLCPP_ERROR(get_logger(),
+                   "[%s] IK UNREACHABLE: all %d seeds failed — "
+                   "pose is not solvable by this arm.",
+                   phase.c_str(), kIkSeeds);
+      logTargetPose(get_logger(), phase, target);
+      last_failure_phase_ = phase;
+      last_failure_reason_ = "IK unreachable (pose not solvable)";
+      return err::PLAN_FAILED;
     }
+    arm->setJointValueTarget(ik_joints);
 
     // Try Pilz PTP first: produces shortest joint-space path, avoids wild
     // rotations caused by OMPL picking a distant IK solution.  Fall back to
@@ -307,6 +519,7 @@ private:
       int attempts = plan_retry_count_ + 1;
       while (attempts-- > 0 && !stop_requested_.load()) {
         if (arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+          logIkResult(plan, phase, planner);
           if (arm->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
             return err::OK;
           }
@@ -320,6 +533,8 @@ private:
       RCLCPP_WARN(get_logger(), "[%s] %s exhausted, trying next planner",
                   phase.c_str(), planner.c_str());
     }
+    last_failure_phase_ = phase;
+    last_failure_reason_ = "all planners exhausted (PTP + RRTConnect)";
     return err::PLAN_FAILED;
   }
 
@@ -362,6 +577,22 @@ private:
       if (v > gripper_close_thresh_) return true;
     }
     return false;
+  }
+
+  // True if every finger is within `tolerance` of the configured open position.
+  // Used by doPick to decide whether the (slow) open-gripper step at the hover
+  // point can be skipped — if the gripper is already open we move straight to
+  // the descend, saving ~0.5 s on a normal pick.
+  bool isGripperOpen(MoveGroupInterfacePtr grip,
+                     double tolerance_m = 0.005) const
+  {
+    auto cur = grip->getCurrentJointValues();
+    if (cur.empty()) return false;
+    const double thresh = gripper_open_pos_ - tolerance_m;
+    for (auto v : cur) {
+      if (v < thresh) return false;
+    }
+    return true;
   }
 
   geometry_msgs::msg::Pose offsetZ(const geometry_msgs::msg::Pose & in, double dz) const
@@ -413,10 +644,40 @@ private:
     auto a = armGroup(arm); auto g = gripGroup(arm);
     if (!a || !g) return err::BAD_REQUEST;
 
+    // Approach uses the user's speed_scale capped at transport_speed_scale_ so
+    // that a very slow speed_scale (e.g. 0.01) is visible, while a very high
+    // one does not exceed the configured transport limit.
+    const double approach_speed = std::min(speed, transport_speed_scale_);
+    RCLCPP_INFO(get_logger(),
+                "pick: speed_scale=%.3f  approach_speed=%.3f  transport_limit=%.3f",
+                speed, approach_speed, transport_speed_scale_);
+
+    // Move to the hover point first (no gripper change here): the user
+    // requested that the gripper not be operated during transit to the hover
+    // pose.  This keeps the approach trajectory deterministic regardless of
+    // the gripper's prior state.
     publishFb(gh, "grasping", "pick.approach", 0.30, "moving above object");
     int rc = jointMoveTo(a, offsetZ(grasp, approach),
-                          transport_speed_scale_, "pick.approach");
+                          approach_speed, "pick.approach");
     if (rc) return rc;
+
+    // At the hover point: only open the gripper if it is currently closed or
+    // half-closed.  When it is already open we skip this step to save ~0.5 s
+    // and to avoid a needless controller command.  This guarantees that the
+    // subsequent descend always happens with the fingers spread, so the
+    // gripper does not push the object away before contact.
+    if (!isGripperOpen(g)) {
+      publishFb(gh, "grasping", "pick.open_gripper", 0.40,
+                "opening gripper at hover");
+      const int og = setGripper(g, gripper_open_pos_, speed);
+      if (og) {
+        RCLCPP_WARN(get_logger(),
+                    "pick.open_gripper failed (rc=%d), continuing anyway", og);
+      }
+    } else {
+      RCLCPP_INFO(get_logger(),
+                  "pick.open_gripper: gripper already open, skipping");
+    }
 
     publishFb(gh, "grasping", "pick.descend", 0.45, "descending to grasp");
     rc = linearMoveTo(a, grasp, speed, "pick.descend");
@@ -426,6 +687,12 @@ private:
       RCLCPP_WARN(get_logger(),
                   "pick.descend cartesian failed, falling back to joint-space");
       rc = jointMoveTo(a, grasp, speed, "pick.descend.jnt");
+      if (!rc) {
+        // Joint fallback succeeded — clear the cartesian failure context so a
+        // later phase (e.g. pick.close_gripper) is not mis-reported as descend.
+        last_failure_phase_.clear();
+        last_failure_reason_.clear();
+      }
     }
     if (rc) return rc;
 
@@ -434,8 +701,12 @@ private:
     if (rc) return rc;
 
     if (!isGripped(g)) {
-      RCLCPP_WARN(get_logger(), "pick: gripper closed empty, retrying once");
-      // simple retry: lift, re-descend, grasp
+      // With the new pick.open_gripper-first step the retry should rarely
+      // trigger — if it still does, the object is genuinely outside grasp
+      // range, so a lift/open/descend cycle is the right recovery.
+      RCLCPP_WARN(get_logger(),
+                  "pick: gripper closed empty after first attempt, retrying "
+                  "lift→open→descend×%d", grasp_retry_count_);
       for (int i = 0; i < grasp_retry_count_ && !isGripped(g); ++i) {
         rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift");
         if (rc) jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift.jnt");
@@ -453,6 +724,10 @@ private:
       RCLCPP_WARN(get_logger(),
                   "pick.retreat cartesian failed, falling back to joint-space");
       rc = jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retreat.jnt");
+      if (!rc) {
+        last_failure_phase_.clear();
+        last_failure_reason_.clear();
+      }
     }
     return rc;
   }
@@ -465,9 +740,14 @@ private:
     auto a = armGroup(arm); auto g = gripGroup(arm);
     if (!a || !g) return err::BAD_REQUEST;
 
+    const double approach_speed = std::min(speed, transport_speed_scale_);
+    RCLCPP_INFO(get_logger(),
+                "place: speed_scale=%.3f  approach_speed=%.3f  transport_limit=%.3f",
+                speed, approach_speed, transport_speed_scale_);
+
     publishFb(gh, "placing", "place.approach", 0.78, "moving above target");
     int rc = jointMoveTo(a, offsetZ(place, approach),
-                          transport_speed_scale_, "place.approach");
+                          approach_speed, "place.approach");
     if (rc) return rc;
 
     publishFb(gh, "placing", "place.descend", 0.85, "descending to place");
@@ -547,6 +827,8 @@ private:
     auto result = std::make_shared<PickPlaceAction::Result>();
 
     stop_requested_.store(false);
+    last_failure_phase_.clear();
+    last_failure_reason_.clear();
     const double approach = goal->approach_offset_m > 0 ? goal->approach_offset_m
                                                         : approach_offset_m_;
     const double retreat  = goal->retreat_offset_m  > 0 ? goal->retreat_offset_m
@@ -556,6 +838,23 @@ private:
 
     geometry_msgs::msg::Pose grasp = goal->grasp_pose;
     geometry_msgs::msg::Pose place = goal->place_pose;
+
+    // Normalize quaternions early; an un-normalized orientation fed to KDL IK
+    // produces a corrupted rotation target and causes unpredictable arm motion.
+    normalizeQuat(grasp, "grasp_pose", get_logger());
+    normalizeQuat(place, "place_pose", get_logger());
+
+    RCLCPP_INFO(get_logger(),
+                "execute: grasp pos=[%.3f,%.3f,%.3f] ori=[%.4f,%.4f,%.4f,%.4f]  "
+                "place pos=[%.3f,%.3f,%.3f] ori=[%.4f,%.4f,%.4f,%.4f]  "
+                "speed=%.3f approach=%.3f retreat=%.3f",
+                grasp.position.x, grasp.position.y, grasp.position.z,
+                grasp.orientation.x, grasp.orientation.y,
+                grasp.orientation.z, grasp.orientation.w,
+                place.position.x, place.position.y, place.position.z,
+                place.orientation.x, place.orientation.y,
+                place.orientation.z, place.orientation.w,
+                speed, approach, retreat);
 
     publishFb(gh, "perceiving", "pick.detect", 0.05, "resolving grasp pose");
     if (goal->pose_source == "camera") {
@@ -589,7 +888,18 @@ private:
               int code, const std::string & msg)
   {
     result->result_code = code;
-    result->message = msg;
+    // Compose a descriptive message: base reason + the specific phase/cause
+    // captured by the motion primitives.  This converts opaque "pick failed"
+    // / "place failed" into actionable feedback like:
+    //   "pick failed at pick.approach: IK unreachable (pose not solvable)"
+    std::string full = msg;
+    if (code != err::OK && !last_failure_phase_.empty()) {
+      full += " at " + last_failure_phase_;
+      if (!last_failure_reason_.empty()) {
+        full += ": " + last_failure_reason_;
+      }
+    }
+    result->message = full;
     if (code == err::OK) {
       result->success = true;
       result->status = "done";
@@ -603,6 +913,8 @@ private:
       result->status = "error";
       gh->abort(result);
     }
+    last_failure_phase_.clear();
+    last_failure_reason_.clear();
     busy_.store(false);
     stop_requested_.store(false);
   }
@@ -625,20 +937,30 @@ private:
   void handleHome(const std::shared_ptr<openarm_skills::srv::GotoHome::Request> req,
                   std::shared_ptr<openarm_skills::srv::GotoHome::Response> resp)
   {
+    const double speed = req->speed_scale > 0 ? req->speed_scale : transport_speed_scale_;
+
     auto run_one = [&](MoveGroupInterfacePtr arm) -> int {
-      arm->setMaxVelocityScalingFactor(req->speed_scale > 0 ? req->speed_scale
-                                                            : transport_speed_scale_);
+      arm->setMaxVelocityScalingFactor(speed);
+      arm->setMaxAccelerationScalingFactor(speed);
       arm->setStartStateToCurrentState();
       arm->setNamedTarget("home");
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       if (arm->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) return err::PLAN_FAILED;
       if (arm->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) return err::EXECUTE_FAILED;
+      // Sync state after execution so the next operation starts from the
+      // correct (home) configuration rather than any cached pre-motion state.
+      arm->setStartStateToCurrentState();
       return err::OK;
     };
 
     int rc = err::OK;
     if (req->arm == "left" || req->arm == "both")  rc = run_one(left_arm_);
     if (rc == err::OK && (req->arm == "right" || req->arm == "both")) rc = run_one(right_arm_);
+
+    // Clear the stop flag set by handleStop so that subsequent service calls
+    // (e.g. gripper) are not immediately rejected with STOPPED_BY_USER.
+    // The next pick_place action also resets this flag at the start of execute().
+    if (rc == err::OK) stop_requested_.store(false);
 
     resp->result_code = rc;
     resp->success = (rc == err::OK);
@@ -648,6 +970,11 @@ private:
   void handleGripper(const std::shared_ptr<openarm_skills::srv::Gripper::Request> req,
                      std::shared_ptr<openarm_skills::srv::Gripper::Response> resp)
   {
+    // If stop was called but no pick_place is currently active (busy_==false),
+    // clear the flag so the standalone gripper command is not rejected.
+    if (stop_requested_.load() && !busy_.load()) {
+      stop_requested_.store(false);
+    }
     auto g = gripGroup(req->arm);
     if (!g) {
       resp->success = false;
@@ -701,6 +1028,13 @@ private:
 
   std::atomic<bool> busy_{false};
   std::atomic<bool> stop_requested_{false};
+
+  // Most-recent failure context captured by linearMoveTo/jointMoveTo so that
+  // finish() can compose a phase-aware action-result message (e.g.
+  // "pick failed at pick.approach: IK unreachable").  Cleared by finish().
+  // Only accessed from the single-threaded action executor.
+  std::string last_failure_phase_;
+  std::string last_failure_reason_;
 };
 
 }  // namespace openarm_skills
