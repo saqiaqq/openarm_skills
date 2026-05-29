@@ -160,17 +160,7 @@ ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace \
   grasp_pose: {position: {x: 0.28, y: -0.18, z: 0.28},
               orientation: {x: 1.0, y: 0.0, z: 0.0, w: 0.0}},
   place_pose: {position: {x: 0.28, y: -0.28, z: 0.28},
-              orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}},
-  approach_offset_m: 0.05, retreat_offset_m: 0.05,
-  speed_scale: 0.10, timeout_s: 120.0}" --feedback
-
-案例2：
-ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace "{cmd_id: 'test-pp-003', arm: 'right', pose_source: 'upper_computer',
-  target_name: '', target_index: 0,
-  grasp_pose: {position: {x: 0.28, y: -0.18, z: 0.28},
-               orientation: {x: 0.0, y: 0.3827, z: 0.0, w: 0.9239}},
-  place_pose: {position: {x: 0.28, y: -0.28, z: 0.28},
-               orientation: {x: 0.0, y: 0.7071, z: 0.0, w: 0.7071}},
+              orientation: {x: 1.0, y: 0.0, z: 0.0, w: 0.0}},
   approach_offset_m: 0.05, retreat_offset_m: 0.05,
   speed_scale: 0.10, timeout_s: 120.0}" --feedback
 

@@ -206,7 +206,7 @@ public:
 
   void configureArmMoveGroup(MoveGroupInterfacePtr arm,
                               const std::string & eef_link,
-                              const std::string & label)
+                              [[maybe_unused]] const std::string & label)
   {
     arm->setEndEffectorLink(eef_link);
     arm->setPoseReferenceFrame(base_frame_);
@@ -216,7 +216,10 @@ public:
     arm->setGoalOrientationTolerance(goal_ori_tol_);
     arm->setMaxVelocityScalingFactor(default_speed_scale_);
     arm->setMaxAccelerationScalingFactor(default_speed_scale_);
-    logCurrentEef(arm, label);
+    // Avoid querying current state during early startup: some ros2_control
+    // joint_state sources publish JointState with zero timestamp, which makes
+    // MoveIt treat the state as "not recent" and log errors. We only need
+    // current TCP for convenience, so skip it here.
   }
 
   void logCurrentEef(MoveGroupInterfacePtr arm, const std::string & label) const
