@@ -17,11 +17,18 @@ Remote RViz viewer for openArm — thin wrapper.
 Delegates entirely to openarm_bimanual_moveit_config/launch/remote_rviz.launch.py
 so that URDF / SRDF / kinematics changes only need to be maintained in one place.
 
-Usage (on viewer machine, same LAN, same ROS_DOMAIN_ID as robot):
+Usage (on viewer machine, same LAN, same ROS_DOMAIN_ID as robot board):
+
     export ROS_DOMAIN_ID=10
-    ros2 launch openarm_skills remote_viewer.launch.py
+    ros2 launch openarm_skills remote_viewer.launch.py use_fake_hardware:=true
+
+Pair with board-side remote_rviz mode, e.g.:
+
+    ros2 launch openarm_skills skills.launch.py \\
+      use_demo:=false use_gravity_comp:=true remote_rviz:=true
 
 Optional overrides (forwarded to remote_rviz.launch.py):
+
     ros2 launch openarm_skills remote_viewer.launch.py use_fake_hardware:=true
 """
 from launch import LaunchDescription

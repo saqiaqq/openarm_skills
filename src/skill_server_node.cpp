@@ -115,7 +115,7 @@ public:
                                   std::string("/openarm/detect_grasp_pose"));
     perception_timeout_s_   = get("perception_timeout_s", 5.0);
 
-    carry_joint4_rad_        = get("carry_joint4_rad", 1.5708);
+    carry_joint4_rad_        = get("carry_joint4_rad", 1.6057);
     carry_joint6_rad_        = get("carry_joint6_rad", 0.0);
     carry_joint7_rad_        = get("carry_joint7_rad", 0.0);
     carry_default_width_m_   = get("carry_default_width_m", 0.307);
@@ -731,6 +731,94 @@ private:
       return err::OK;
     }
     return err::EXECUTE_FAILED;
+  }
+
+  // Drive both grippers to the same target in parallel so left/right fingers
+  // open or close together (used by carry_action after synchronized arm motion).
+  int setBothGrippers(double target_m, double speed_scale,
+                      bool compliance_grasp = false,
+                      double force = 0.0,
+                      double gripper_speed = 0.0)
+  {
+    if (stop_requested_.load()) return err::STOPPED_BY_USER;
+    const double max_effort = normalizedGripperForce(force);
+    const double speed = normalizedGripperSpeed(gripper_speed);
+
+    if (max_effort <= 0.0 && gripper_speed <= 0.0) {
+      int rc = setGripper(left_grip_, "left", target_m, speed_scale,
+                          compliance_grasp, force, gripper_speed);
+      if (rc != err::OK) return rc;
+      return setGripper(right_grip_, "right", target_m, speed_scale,
+                        compliance_grasp, force, gripper_speed);
+    }
+
+    auto left_client = gripperCommandClient("left");
+    auto right_client = gripperCommandClient("right");
+    if (!left_client || !right_client) return err::BAD_REQUEST;
+    if (!left_client->wait_for_action_server(std::chrono::seconds(2)) ||
+        !right_client->wait_for_action_server(std::chrono::seconds(2))) {
+      RCLCPP_ERROR(get_logger(), "carry_action: gripper action server unavailable");
+      return err::ACTION_TIMEOUT;
+    }
+
+    publishGripperAuxCommand("left", speed, max_effort);
+    publishGripperAuxCommand("right", speed, max_effort);
+
+    GripperCommand::Goal left_goal;
+    GripperCommand::Goal right_goal;
+    left_goal.command.position = target_m;
+    left_goal.command.max_effort = max_effort;
+    right_goal.command.position = target_m;
+    right_goal.command.max_effort = max_effort;
+
+    RCLCPP_INFO(get_logger(),
+                "carry_action: sending synchronized gripper goals "
+                "(target=%.4fm max_effort=%.2f speed=%.2f)",
+                target_m, max_effort, speed);
+
+    auto left_goal_future = left_client->async_send_goal(left_goal);
+    auto right_goal_future = right_client->async_send_goal(right_goal);
+
+    if (left_goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready ||
+        right_goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+      RCLCPP_ERROR(get_logger(),
+                   "carry_action: timed out waiting for gripper goal acceptance");
+      return err::ACTION_TIMEOUT;
+    }
+
+    auto left_handle = left_goal_future.get();
+    auto right_handle = right_goal_future.get();
+    if (!left_handle || !right_handle) {
+      RCLCPP_ERROR(get_logger(), "carry_action: gripper goal rejected");
+      return err::EXECUTE_FAILED;
+    }
+
+    auto left_result_future = left_client->async_get_result(left_handle);
+    auto right_result_future = right_client->async_get_result(right_handle);
+    const auto timeout = std::chrono::duration<double>(std::max(1.0, step_timeout_s_));
+    if (left_result_future.wait_for(timeout) != std::future_status::ready ||
+        right_result_future.wait_for(timeout) != std::future_status::ready) {
+      RCLCPP_ERROR(get_logger(),
+                   "carry_action: timed out waiting for gripper result");
+      return err::ACTION_TIMEOUT;
+    }
+
+    const auto left_wrapped = left_result_future.get();
+    const auto right_wrapped = right_result_future.get();
+
+    auto gripper_ok = [&](const auto & wrapped, MoveGroupInterfacePtr grip) -> bool {
+      if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED && wrapped.result) {
+        return wrapped.result->reached_goal || wrapped.result->stalled ||
+               (compliance_grasp && isGripped(grip));
+      }
+      return compliance_grasp && isGripped(grip);
+    };
+
+    if (!gripper_ok(left_wrapped, left_grip_) || !gripper_ok(right_wrapped, right_grip_)) {
+      RCLCPP_ERROR(get_logger(), "carry_action: gripper controller reported failure");
+      return err::EXECUTE_FAILED;
+    }
+    return err::OK;
   }
 
   double currentGripperTargetOrClosed(MoveGroupInterfacePtr grip) const
@@ -1925,12 +2013,7 @@ private:
     std::string message;
     int rc = executeBothCarryWithControllers(req->width, speed, actual_width, message);
     if (rc == err::OK) {
-      rc = setGripper(left_grip_, "left", gripper_target, speed,
-                      false, 0.0, speed);
-      if (rc == err::OK) {
-        rc = setGripper(right_grip_, "right", gripper_target, speed,
-                        false, 0.0, speed);
-      }
+      rc = setBothGrippers(gripper_target, speed, false, 0.0, speed);
       if (rc != err::OK) {
         message = "carry_action: gripper command failed";
       }

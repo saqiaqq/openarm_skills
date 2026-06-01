@@ -31,7 +31,24 @@ run_svc() {
   timeout 60s ros2 service call "$@"
 }
 
+'''
+启动方式：
+demo（默认）：  ros2 launch openarm_skills skills.launch.py
+重力补偿： ros2 launch openarm_skills skills.launch.py use_demo:=false use_gravity_comp:=true
+重力补偿+远程RViz（板端假硬件、不启本地RViz）：
+  板卡：ros2 launch openarm_skills skills.launch.py use_demo:=false use_gravity_comp:=true remote_rviz:=true
+  远程Ubuntu：ros2 launch openarm_skills remote_viewer.launch.py use_fake_hardware:=true
+仅skills：  ros2 launch openarm_skills skills.launch.py use_demo:=false
+'''
+
+
 # --- 1. gripper: open / half_close / grasp / close ---
+'''
+案例：
+ros2 service call /openarm/gripper openarm_skills/srv/Gripper   "{arm: 'left', action: 'grasp', position: 0.00, force: 0.1, speed: 0.05}"
+'''
+
+
 : <<'GRIPPER_NOTES'
 注释说明爪子相关功能的各参数的意义：
 arm: 选择夹爪，left 或 right
@@ -57,6 +74,10 @@ run_svc "gripper open (right)" /openarm/gripper openarm_skills/srv/Gripper \
   "{arm: 'right', action: 'open', position: 0.0, force: 0.0, speed: 0.5}"
 
 # --- 2. goto_home ---
+'''
+案例：
+ros2 service call /openarm/goto_home openarm_skills/srv/GotoHome "{arm: 'both', speed_scale: 0.15}"
+'''
 run_svc "goto_home both" /openarm/goto_home openarm_skills/srv/GotoHome \
   "{arm: 'both', speed_scale: 0.15}"
 
@@ -65,7 +86,7 @@ run_svc "goto_home both" /openarm/goto_home openarm_skills/srv/GotoHome \
 # gripper: close | open | half_close。
 '''
 命令行测试用例：
-ros2 service call /openarm/carry_action openarm_skills/srv/CarryAction "{width: 100.0, gripper: 'open', speed_scale: 0.15}"
+ros2 service call /openarm/carry_action openarm_skills/srv/CarryAction "{width: 0.318, gripper: 'open', speed_scale: 0.15}"
 
 width: 单位 m；0.0 表示默认宽度 0.307m，最大0.384，最小0.20，超过范围会默认用0.307或者报错
 gripper: 只能是 close、open、half_close

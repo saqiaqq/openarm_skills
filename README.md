@@ -21,14 +21,22 @@ The same package also defines the generic JSON envelope srv used by
 ## Quick start
 
 ```bash
-# One-shot: demo (MoveIt + controllers + RViz) + skill_server (default)
+# Default: demo MoveIt stack + skill_server (no gravity feedforward)
 ros2 launch openarm_skills skills.launch.py
+
+# Gravity-compensated MoveIt stack + skill_server
+ros2 launch openarm_skills skills.launch.py use_demo:=false use_gravity_comp:=true
+
+# Same as above, but fake hardware + no local RViz (viewer on another Ubuntu PC)
+ros2 launch openarm_skills skills.launch.py use_demo:=false use_gravity_comp:=true remote_rviz:=true
+# On viewer PC (same ROS_DOMAIN_ID):
+# ros2 launch openarm_skills remote_viewer.launch.py use_fake_hardware:=true
+
+# Skills only (MoveIt stack already running in another terminal)
+ros2 launch openarm_skills skills.launch.py use_demo:=false
 
 # Headless / no RViz
 ros2 launch openarm_skills skills.launch.py use_rviz:=false
-
-# Skills only (demo already running in another terminal)
-ros2 launch openarm_skills skills.launch.py use_demo:=false
 
 # (optional) perception stub for pose_source=camera
 ros2 launch openarm_perception perception.launch.py

@@ -1,24 +1,19 @@
 # Copyright 2026 User
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
-Launch OpenArm skill server, optionally with MoveIt demo stack.
+Launch OpenArm skill server with one of three stack modes:
 
-Default (use_demo:=true): starts demo.launch.py (controllers + move_group + RViz)
-then skill_server_node after a short delay so MoveIt is ready.
+  use_demo:=true              MoveIt demo stack (default, unchanged behaviour)
+  use_gravity_comp:=true      MoveIt + gravity-compensated hardware feedforward
+  both false                  skill_server only (stack already running elsewhere)
 
-Skills-only (use_demo:=false): only skill_server_node — same as the old workflow
-when demo is already running in another terminal.
+use_demo and use_gravity_comp are mutually exclusive.
+
+remote_rviz:=true             Board-side sim / remote-view: fake hardware, no local
+                              RViz. On another PC (same ROS_DOMAIN_ID):
+                              ros2 launch openarm_skills remote_viewer.launch.py \\
+                                use_fake_hardware:=true
 """
 import os
 
@@ -29,9 +24,9 @@ from launch.actions import (
     IncludeLaunchDescription,
     TimerAction,
 )
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from moveit_configs_utils import MoveItConfigsBuilder
@@ -46,32 +41,50 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "use_demo",
             default_value="true",
-            description="If true, also launch openarm_bimanual_moveit_config demo.launch.py",
+            description="Launch demo.launch.py (MoveIt + JTC, no gravity feedforward).",
+        ),
+        DeclareLaunchArgument(
+            "use_gravity_comp",
+            default_value="false",
+            description="Launch demo_gravity.launch.py (MoveIt + KDL gravity feedforward).",
         ),
         DeclareLaunchArgument(
             "use_rviz",
             default_value="true",
-            description="Passed to demo.launch.py when use_demo is true",
+            description="Start RViz on this machine (ignored when remote_rviz:=true).",
+        ),
+        DeclareLaunchArgument(
+            "remote_rviz",
+            default_value="false",
+            description=(
+                "Sim + remote RViz mode on this machine: use_fake_hardware:=true, "
+                "use_rviz:=false. Run remote_viewer.launch.py on the viewer PC."
+            ),
         ),
         DeclareLaunchArgument(
             "use_fake_hardware",
             default_value="false",
-            description="Passed to demo.launch.py (true = no real CAN motors)",
+            description="Use fake ros2_control hardware (forced true when remote_rviz:=true).",
         ),
         DeclareLaunchArgument(
             "right_can_interface",
             default_value="can0",
-            description="Passed to demo.launch.py",
+            description="Passed to the selected MoveIt launch file.",
         ),
         DeclareLaunchArgument(
             "left_can_interface",
             default_value="can1",
-            description="Passed to demo.launch.py",
+            description="Passed to the selected MoveIt launch file.",
+        ),
+        DeclareLaunchArgument(
+            "gravity_scale",
+            default_value="1.0",
+            description="Gravity feedforward scale (gravity stack only).",
         ),
         DeclareLaunchArgument(
             "skill_startup_delay_s",
             default_value="8.0",
-            description="Seconds to wait for demo/controllers before skill_server starts",
+            description="Seconds to wait for stack before skill_server starts.",
         ),
     ]
 
@@ -79,56 +92,118 @@ def generate_launch_description():
         "openarm", package_name="openarm_bimanual_moveit_config"
     ).to_moveit_configs()
 
+    skill_params = [
+        moveit_config.robot_description,
+        moveit_config.robot_description_semantic,
+        moveit_config.robot_description_kinematics,
+        cfg,
+    ]
+
     skill_server_node = Node(
         package="openarm_skills",
         executable="skill_server_node",
         name="skill_server",
         output="screen",
-        parameters=[
-            moveit_config.robot_description,
-            moveit_config.robot_description_semantic,
-            moveit_config.robot_description_kinematics,
-            cfg,
-        ],
+        parameters=skill_params,
     )
+
+    demo_condition = IfCondition(
+        PythonExpression(
+            [
+                "'",
+                LaunchConfiguration("use_demo"),
+                "' == 'true' and '",
+                LaunchConfiguration("use_gravity_comp"),
+                "' != 'true'",
+            ]
+        )
+    )
+
+    gravity_condition = IfCondition(LaunchConfiguration("use_gravity_comp"))
+
+    stack_only_condition = IfCondition(
+        PythonExpression(
+            [
+                "'",
+                LaunchConfiguration("use_demo"),
+                "' != 'true' and '",
+                LaunchConfiguration("use_gravity_comp"),
+                "' != 'true'",
+            ]
+        )
+    )
+
+    stack_with_delay_condition = IfCondition(
+        PythonExpression(
+            [
+                "'",
+                LaunchConfiguration("use_demo"),
+                "' == 'true' or '",
+                LaunchConfiguration("use_gravity_comp"),
+                "' == 'true'",
+            ]
+        )
+    )
+
+    shared_launch_args = {
+        "use_rviz": PythonExpression([
+            "'false' if '",
+            LaunchConfiguration("remote_rviz"),
+            "' == 'true' else '",
+            LaunchConfiguration("use_rviz"),
+            "'",
+        ]),
+        "use_fake_hardware": PythonExpression([
+            "'true' if '",
+            LaunchConfiguration("remote_rviz"),
+            "' == 'true' else '",
+            LaunchConfiguration("use_fake_hardware"),
+            "'",
+        ]),
+        "right_can_interface": LaunchConfiguration("right_can_interface"),
+        "left_can_interface": LaunchConfiguration("left_can_interface"),
+    }
 
     demo_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             FindPackageShare("openarm_bimanual_moveit_config"),
             "/launch/demo.launch.py",
         ]),
+        launch_arguments=shared_launch_args.items(),
+        condition=demo_condition,
+    )
+
+    gravity_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            FindPackageShare("openarm_bimanual_moveit_config"),
+            "/launch/demo_gravity.launch.py",
+        ]),
         launch_arguments={
-            "use_rviz": LaunchConfiguration("use_rviz"),
-            "use_fake_hardware": LaunchConfiguration("use_fake_hardware"),
-            "right_can_interface": LaunchConfiguration("right_can_interface"),
-            "left_can_interface": LaunchConfiguration("left_can_interface"),
+            **shared_launch_args,
+            "gravity_scale": LaunchConfiguration("gravity_scale"),
         }.items(),
-        condition=IfCondition(LaunchConfiguration("use_demo")),
+        condition=gravity_condition,
     )
 
     delayed_skill_server = TimerAction(
         period=LaunchConfiguration("skill_startup_delay_s"),
         actions=[skill_server_node],
-        condition=IfCondition(LaunchConfiguration("use_demo")),
+        condition=stack_with_delay_condition,
     )
 
     return LaunchDescription(
         declared_arguments
         + [
             demo_launch,
+            gravity_launch,
             delayed_skill_server,
             Node(
                 package="openarm_skills",
                 executable="skill_server_node",
                 name="skill_server",
                 output="screen",
-                parameters=[
-                    moveit_config.robot_description,
-                    moveit_config.robot_description_semantic,
-                    moveit_config.robot_description_kinematics,
-                    cfg,
-                ],
-                condition=UnlessCondition(LaunchConfiguration("use_demo")),
+                parameters=skill_params,
+                condition=stack_only_condition,
             ),
         ]
     )
