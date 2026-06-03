@@ -185,14 +185,34 @@ ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace \
   approach_offset_m: 0.05, retreat_offset_m: 0.05,
   speed_scale: 0.10, timeout_s: 120.0}" --feedback
 
+案例1e（左臂：身后抓取 → 身前放置，已仿真验证）：
+  要点：
+  - grasp 在身后（-X, y>0 为左臂侧），place 在身前（+X）；四元数用水平 palm 朝上，勿用 (1,0,0,0) 垂直朝下（身后点 IK 易失败）
+  - target_radius：pick.approach 绕抓取点球体；transport/place.approach 不避障；place.retreat 绕放置点球体
+  - place.z=0.68 可达；若需更稳可改为 z=0.52（见下方注释）
+ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace "{cmd_id: 'test-pp-1e', arm: 'left', pose_source: 'upper_computer',
+  target_name: '', target_index: 0,
+  grasp_pose: {position: {x: -0.25, y: 0.08, z: 0.28},
+              orientation: {x: -0.7071, y: 0.0, z: 0.7071, w: 0.0}},
+  place_pose: {position: {x: 0.48, y: 0.18, z: 0.68},
+              orientation: {x: 0.7071, y: 0.0, z: 0.7071, w: 0.0}},
+  approach_offset_m: 0.05, retreat_offset_m: 0.05,
+  target_radius: 0.04, gripper_force: 8.0, gripper_speed: 0.3,
+  speed_scale: 0.10, timeout_s: 120.0}" --feedback
+# 备选（身前放置略低、更稳）：place_pose z=0.52 → position: {x: 0.36, y: 0.17, z: 0.52}
+
 
 Feedback: status: perceiving / phase: pick.detect          ← 解析抓取位姿（upper_computer模式直接跳过）
-Feedback: status: grasping  / phase: pick.approach         ← Pilz PTP 运动到悬停点（grasp+0.05m），全程不动夹爪
-Feedback: status: grasping  / phase: pick.open_gripper     ← 到达悬停点后，仅当爪子非「张开」状态才张开；已张开则跳过此阶段
+Feedback: status: grasping  / phase: pick.open_gripper     ← 前往目标前先张开夹爪；已张开则跳过
+Feedback: status: grasping  / phase: pick.approach         ← 夹爪已张开后运动到悬停点（grasp+approach_offset）
 Feedback: status: grasping  / phase: pick.descend          ← 笛卡尔直线下降到grasp点（爪子已张开）
 Feedback: status: grasping  / phase: pick.close_gripper    ← 闭合夹爪抓取物体
 Feedback: status: grasping  / phase: pick.fake_grasp        ← RViz调试开关打开时：无物体也假定已抓住
-Feedback: status: placing   / phase: place.approach         ← 继续执行放置流程
+Feedback: status: transporting / phase: transport            ← 前往放置区（无避障球体）
+Feedback: status: placing   / phase: place.approach         ← 到放置悬停点（无避障球体）
+Feedback: status: placing   / phase: place.descend           ← 下降到 place 点
+Feedback: status: placing   / phase: place.open_gripper     ← 张开夹爪释放
+Feedback: status: placing   / phase: place.retreat           ← 撤离时绕放置点 target_radius 球体
 Feedback: status: returning / phase: return.start           ← 放置后回到本次动作开始时的手臂关节位
 Feedback: status: returning / phase: return.home            ← 如果没有起始关节位或 return.start 失败，则回 home
 Feedback: status: returning / phase: return.restore_gripper ← 恢复动作开始时的夹爪状态；读不到时默认闭合
@@ -222,6 +242,7 @@ ros2 action send_goal /openarm/pick_place openarm_skills/action/PickPlace \
     place_pose: {position: {x: 0.30, y: -0.20, z: 0.20},
                  orientation: {x: 0.0, y: 0.7071, z: 0.0, w: 0.7071}},
     approach_offset_m: 0.05, retreat_offset_m: 0.05,
+    target_radius: 0.04, gripper_force: 8.0, gripper_speed: 0.3,
     speed_scale: 0.10, timeout_s: 60.0}" --feedback || true
 
 echo ""

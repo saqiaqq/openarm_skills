@@ -106,6 +106,7 @@ public:
     gripper_close_thresh_   = get("gripper_close_threshold_m", 0.001);
     gripper_max_force_      = get("gripper_max_force_n", 40.0);
     gripper_default_speed_  = get("gripper_default_speed", 0.5);
+    eef_obstacle_margin_m_  = get("eef_obstacle_margin_m", 0.02);
 
     workspace_radius_       = get("workspace_radius_m", 1.20);
     min_z_                  = get("min_z_m", -0.10);
@@ -424,6 +425,129 @@ private:
     return r < workspace_radius_ &&
            p.position.z >= min_z_ &&
            p.position.z <= max_z_;
+  }
+
+  static double pointDistance(const geometry_msgs::msg::Point & a,
+                              const geometry_msgs::msg::Point & b)
+  {
+    const double dx = a.x - b.x;
+    const double dy = a.y - b.y;
+    const double dz = a.z - b.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  static bool segmentIntersectsSphere(
+      const geometry_msgs::msg::Point & a,
+      const geometry_msgs::msg::Point & b,
+      const geometry_msgs::msg::Point & center,
+      double radius)
+  {
+    if (radius <= 0.0) return false;
+    const double abx = b.x - a.x;
+    const double aby = b.y - a.y;
+    const double abz = b.z - a.z;
+    const double ab_len_sq = abx * abx + aby * aby + abz * abz;
+    geometry_msgs::msg::Point closest = a;
+    if (ab_len_sq > 1e-12) {
+      double t = ((center.x - a.x) * abx +
+                    (center.y - a.y) * aby +
+                    (center.z - a.z) * abz) / ab_len_sq;
+      t = std::max(0.0, std::min(1.0, t));
+      closest.x = a.x + t * abx;
+      closest.y = a.y + t * aby;
+      closest.z = a.z + t * abz;
+    }
+    return pointDistance(closest, center) < radius;
+  }
+
+  geometry_msgs::msg::Pose makeAvoidanceViaPose(
+      const geometry_msgs::msg::Pose & from,
+      const geometry_msgs::msg::Pose & to,
+      const geometry_msgs::msg::Point & center,
+      double radius,
+      double margin) const
+  {
+    geometry_msgs::msg::Pose via = to;
+    via.orientation = from.orientation;
+    const double shell = radius + margin;
+    via.position.x = 0.5 * (from.position.x + to.position.x);
+    via.position.y = 0.5 * (from.position.y + to.position.y);
+    via.position.z = std::max({from.position.z, to.position.z, center.z + shell});
+
+    const double dx = via.position.x - center.x;
+    const double dy = via.position.y - center.y;
+    const double horiz = std::sqrt(dx * dx + dy * dy);
+    if (horiz < shell) {
+      if (horiz > 1e-6) {
+        const double scale = shell / horiz;
+        via.position.x = center.x + dx * scale;
+        via.position.y = center.y + dy * scale;
+      } else {
+        via.position.x = center.x + shell;
+        via.position.y = center.y;
+      }
+    }
+    return via;
+  }
+
+  double effectiveApproachOffset(double approach, double target_radius) const
+  {
+    if (target_radius <= 0.0) return approach;
+    const double min_hover_dist = target_radius + eef_obstacle_margin_m_;
+    const double hover_dist = std::max(approach, min_hover_dist);
+    if (hover_dist > approach) {
+      RCLCPP_INFO(get_logger(),
+                  "pick: raising approach_offset %.3f -> %.3f m "
+                  "(target_radius=%.3f + margin=%.3f)",
+                  approach, hover_dist, target_radius, eef_obstacle_margin_m_);
+    }
+    return hover_dist;
+  }
+
+  // Joint-space motion that inserts a via pose when the straight EEF segment
+  // would pass through the forbidden sphere around the grasp target.
+  int jointMoveToAvoid(MoveGroupInterfacePtr arm,
+                       const geometry_msgs::msg::Pose & target,
+                       double speed_scale,
+                       const std::string & phase,
+                       const geometry_msgs::msg::Point & obstacle_center,
+                       double obstacle_radius)
+  {
+    if (obstacle_radius <= 0.0) {
+      return jointMoveTo(arm, target, speed_scale, phase);
+    }
+
+    const double shell = obstacle_radius + eef_obstacle_margin_m_;
+    if (pointDistance(target.position, obstacle_center) < shell) {
+      RCLCPP_WARN(get_logger(),
+                  "[%s] target inside obstacle shell (dist=%.3f < %.3f), "
+                  "planning without via",
+                  phase.c_str(),
+                  pointDistance(target.position, obstacle_center), shell);
+      return jointMoveTo(arm, target, speed_scale, phase);
+    }
+
+    const auto current = arm->getCurrentPose(arm->getEndEffectorLink());
+    if (!segmentIntersectsSphere(current.pose.position, target.position,
+                                 obstacle_center, shell)) {
+      return jointMoveTo(arm, target, speed_scale, phase);
+    }
+
+    const auto via = makeAvoidanceViaPose(
+      current.pose, target, obstacle_center, obstacle_radius, eef_obstacle_margin_m_);
+    RCLCPP_INFO(get_logger(),
+                "[%s] EEF path crosses target sphere (r=%.3f), inserting via "
+                "pos=[%.3f,%.3f,%.3f]",
+                phase.c_str(), obstacle_radius,
+                via.position.x, via.position.y, via.position.z);
+    int rc = jointMoveTo(arm, via, speed_scale, phase + ".via");
+    if (rc) {
+      RCLCPP_WARN(get_logger(),
+                  "[%s] via pose unreachable, falling back to direct motion",
+                  phase.c_str());
+      return jointMoveTo(arm, target, speed_scale, phase);
+    }
+    return jointMoveTo(arm, target, speed_scale, phase);
   }
 
   // Cartesian linear motion. Returns err::OK on success.
@@ -1486,9 +1610,8 @@ private:
   }
 
   // True if every finger is within `tolerance` of the configured open position.
-  // Used by doPick to decide whether the (slow) open-gripper step at the hover
-  // point can be skipped — if the gripper is already open we move straight to
-  // the descend, saving ~0.5 s on a normal pick.
+  // Used by doPick to skip open-gripper when fingers are already spread before
+  // the approach move.
   bool isGripperOpen(MoveGroupInterfacePtr grip,
                      double tolerance_m = 0.005) const
   {
@@ -1545,6 +1668,7 @@ private:
   int doPick(const std::string & arm,
              const geometry_msgs::msg::Pose & grasp,
              double approach, double retreat, double speed,
+             double target_radius,
              double gripper_force,
              double gripper_speed,
              const std::shared_ptr<PickPlaceGoalHandle> & gh)
@@ -1556,27 +1680,19 @@ private:
     // that a very slow speed_scale (e.g. 0.01) is visible, while a very high
     // one does not exceed the configured transport limit.
     const double approach_speed = std::min(speed, transport_speed_scale_);
+    const double effective_approach =
+      effectiveApproachOffset(approach, target_radius);
     RCLCPP_INFO(get_logger(),
-                "pick: speed_scale=%.3f  approach_speed=%.3f  transport_limit=%.3f",
-                speed, approach_speed, transport_speed_scale_);
+                "pick: speed_scale=%.3f  approach_speed=%.3f  transport_limit=%.3f "
+                "target_radius=%.3f gripper_force=%.1f",
+                speed, approach_speed, transport_speed_scale_,
+                target_radius, gripper_force);
 
-    // Move to the hover point first (no gripper change here): the user
-    // requested that the gripper not be operated during transit to the hover
-    // pose.  This keeps the approach trajectory deterministic regardless of
-    // the gripper's prior state.
-    publishFb(gh, "grasping", "pick.approach", 0.30, "moving above object");
-    int rc = jointMoveTo(a, offsetZ(grasp, approach),
-                          approach_speed, "pick.approach");
-    if (rc) return rc;
-
-    // At the hover point: only open the gripper if it is currently closed or
-    // half-closed.  When it is already open we skip this step to save ~0.5 s
-    // and to avoid a needless controller command.  This guarantees that the
-    // subsequent descend always happens with the fingers spread, so the
-    // gripper does not push the object away before contact.
+    // Open gripper before moving toward the grasp target so approach/descend
+    // never push the object with closed fingers.
     if (!isGripperOpen(g)) {
-      publishFb(gh, "grasping", "pick.open_gripper", 0.40,
-                "opening gripper at hover");
+      publishFb(gh, "grasping", "pick.open_gripper", 0.22,
+                "opening gripper before approach");
       const int og = setGripper(g, arm, gripper_open_pos_, speed,
                                 false, 0.0, gripper_speed);
       if (og) {
@@ -1587,6 +1703,12 @@ private:
       RCLCPP_INFO(get_logger(),
                   "pick.open_gripper: gripper already open, skipping");
     }
+
+    publishFb(gh, "grasping", "pick.approach", 0.30, "moving above object");
+    int rc = jointMoveToAvoid(a, offsetZ(grasp, effective_approach),
+                              approach_speed, "pick.approach",
+                              grasp.position, target_radius);
+    if (rc) return rc;
 
     publishFb(gh, "grasping", "pick.descend", 0.45, "descending to grasp");
     rc = linearMoveTo(a, grasp, speed, "pick.descend");
@@ -1618,9 +1740,8 @@ private:
         publishFb(gh, "grasping", "pick.fake_grasp", 0.60,
                   "RViz debug: assuming object is held");
       } else {
-        // With the new pick.open_gripper-first step the retry should rarely
-        // trigger — if it still does, the object is genuinely outside grasp
-        // range, so a lift/open/descend cycle is the right recovery.
+        // Gripper is opened before approach; if retry still triggers the object
+        // is likely outside grasp range — lift/open/descend is the recovery.
         RCLCPP_WARN(get_logger(),
                     "pick: gripper closed empty after first attempt, retrying "
                     "lift→open→descend×%d", grasp_retry_count_);
@@ -1655,16 +1776,22 @@ private:
   int doPlace(const std::string & arm,
               const geometry_msgs::msg::Pose & place,
               double approach, double retreat, double speed,
+              double place_obstacle_radius,
               const std::shared_ptr<PickPlaceGoalHandle> & gh)
   {
     auto a = armGroup(arm); auto g = gripGroup(arm);
     if (!a || !g) return err::BAD_REQUEST;
 
     const double approach_speed = std::min(speed, transport_speed_scale_);
+    const double effective_retreat =
+      effectiveApproachOffset(retreat, place_obstacle_radius);
     RCLCPP_INFO(get_logger(),
-                "place: speed_scale=%.3f  approach_speed=%.3f  transport_limit=%.3f",
-                speed, approach_speed, transport_speed_scale_);
+                "place: speed_scale=%.3f  approach_speed=%.3f  transport_limit=%.3f "
+                "place_obstacle_radius=%.3f effective_retreat=%.3f",
+                speed, approach_speed, transport_speed_scale_,
+                place_obstacle_radius, effective_retreat);
 
+    // transport / place.approach: no obstacle sphere (object is held in transit).
     publishFb(gh, "placing", "place.approach", 0.78, "moving above target");
     int rc = jointMoveTo(a, offsetZ(place, approach),
                           approach_speed, "place.approach");
@@ -1687,15 +1814,22 @@ private:
     rc = setGripper(g, arm, gripper_open_pos_, speed);
     if (rc) return rc;
 
-    publishFb(gh, "placing", "place.retreat", 0.97, "lifting away");
-    rc = linearMoveTo(a, offsetZ(place, retreat), speed, "place.retreat");
-    if (rc) {
-      RCLCPP_WARN(get_logger(),
-                  "place.retreat cartesian failed, falling back to joint-space");
-      rc = jointMoveTo(a, offsetZ(place, retreat), speed, "place.retreat.jnt");
-      if (!rc) {
-        last_failure_phase_.clear();
-        last_failure_reason_.clear();
+    // place.retreat: avoid the placed-object sphere (center = place pose).
+    publishFb(gh, "placing", "place.retreat", 0.97, "lifting away from place");
+    const auto retreat_pose = offsetZ(place, effective_retreat);
+    if (place_obstacle_radius > 0.0) {
+      rc = jointMoveToAvoid(a, retreat_pose, speed, "place.retreat",
+                            place.position, place_obstacle_radius);
+    } else {
+      rc = linearMoveTo(a, retreat_pose, speed, "place.retreat");
+      if (rc) {
+        RCLCPP_WARN(get_logger(),
+                    "place.retreat cartesian failed, falling back to joint-space");
+        rc = jointMoveTo(a, retreat_pose, speed, "place.retreat.jnt");
+        if (!rc) {
+          last_failure_phase_.clear();
+          last_failure_reason_.clear();
+        }
       }
     }
     return rc;
@@ -1813,6 +1947,10 @@ private:
                                                   : default_speed_scale_;
     const double gripper_force = normalizedGripperForce(goal->gripper_force);
     const double gripper_speed = normalizedGripperSpeed(goal->gripper_speed);
+    const double target_radius =
+      (std::isfinite(goal->target_radius) && goal->target_radius > 0.0)
+        ? goal->target_radius
+        : 0.0;
 
     auto start_arm = armGroup(goal->arm);
     auto start_grip = gripGroup(goal->arm);
@@ -1839,14 +1977,16 @@ private:
     RCLCPP_INFO(get_logger(),
                 "execute: grasp pos=[%.3f,%.3f,%.3f] ori=[%.4f,%.4f,%.4f,%.4f]  "
                 "place pos=[%.3f,%.3f,%.3f] ori=[%.4f,%.4f,%.4f,%.4f]  "
-                "speed=%.3f approach=%.3f retreat=%.3f",
+                "speed=%.3f approach=%.3f retreat=%.3f target_radius=%.3f "
+                "gripper_force=%.1f gripper_speed=%.2f",
                 grasp.position.x, grasp.position.y, grasp.position.z,
                 grasp.orientation.x, grasp.orientation.y,
                 grasp.orientation.z, grasp.orientation.w,
                 place.position.x, place.position.y, place.position.z,
                 place.orientation.x, place.orientation.y,
                 place.orientation.z, place.orientation.w,
-                speed, approach, retreat);
+                speed, approach, retreat, target_radius,
+                gripper_force, gripper_speed);
 
     publishFb(gh, "perceiving", "pick.detect", 0.05, "resolving grasp pose");
     if (goal->pose_source == "camera") {
@@ -1857,7 +1997,7 @@ private:
       return finish(gh, result, err::BAD_REQUEST, "grasp_pose outside workspace");
     }
 
-    int rc = doPick(goal->arm, grasp, approach, retreat, speed,
+    int rc = doPick(goal->arm, grasp, approach, retreat, speed, target_radius,
                     gripper_force, gripper_speed, gh);
     if (rc) return finish(gh, result, rc, "pick failed");
 
@@ -1870,7 +2010,9 @@ private:
       return finish(gh, result, err::BAD_REQUEST, "place_pose outside workspace");
     }
 
-    rc = doPlace(goal->arm, place, approach, retreat, speed, gh);
+    // transport + place.approach/descend: no sphere avoidance.
+    // place.retreat uses target_radius around place_pose (released object).
+    rc = doPlace(goal->arm, place, approach, retreat, speed, target_radius, gh);
     if (rc) return finish(gh, result, rc, "place failed");
 
     rc = doPostPlaceReturn(goal->arm, start_arm_joints, start_gripper_target, speed, gh);
@@ -2085,6 +2227,7 @@ private:
   bool   debug_assume_grasp_success_;
   double gripper_open_pos_, gripper_half_pos_, gripper_closed_pos_;
   double gripper_close_thresh_, gripper_max_force_, gripper_default_speed_;
+  double eef_obstacle_margin_m_;
   double workspace_radius_, min_z_, max_z_;
   double perception_timeout_s_;
   double carry_joint4_rad_, carry_joint6_rad_, carry_joint7_rad_;
