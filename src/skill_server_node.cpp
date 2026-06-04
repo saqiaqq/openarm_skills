@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <control_msgs/action/gripper_command.hpp>
@@ -76,6 +77,7 @@ public:
     right_arm_group_        = get("right_arm_group",  std::string("right_arm"));
     left_grip_group_        = get("left_gripper_group",  std::string("left_gripper"));
     right_grip_group_       = get("right_gripper_group", std::string("right_gripper"));
+    upper_body_group_       = get("upper_body_group",    std::string("upper_body"));
     base_frame_             = get("base_frame",       std::string("world"));
     left_eef_link_          = get("left_eef_link",    std::string("openarm_left_hand_tcp"));
     right_eef_link_         = get("right_eef_link",   std::string("openarm_right_hand_tcp"));
@@ -126,6 +128,8 @@ public:
       perception_srv_name_);
     traj_callback_group_ =
       this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    gripper_srv_cb_group_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     left_arm_traj_client_ = rclcpp_action::create_client<FollowJointTrajectory>(
       this, "/left_joint_trajectory_controller/follow_joint_trajectory",
       traj_callback_group_);
@@ -160,7 +164,9 @@ public:
     gripper_srv_ = this->create_service<openarm_skills::srv::Gripper>(
       "/openarm/gripper",
       std::bind(&SkillServerNode::handleGripper, this,
-                std::placeholders::_1, std::placeholders::_2));
+                std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default,
+      gripper_srv_cb_group_);
 
     // ---- action server -----------------------------------------------------
     using namespace std::placeholders;
@@ -184,9 +190,14 @@ public:
     right_arm_  = std::make_shared<MoveGroupInterface>(mg_node_, right_arm_group_);
     left_grip_  = std::make_shared<MoveGroupInterface>(mg_node_, left_grip_group_);
     right_grip_ = std::make_shared<MoveGroupInterface>(mg_node_, right_grip_group_);
+    upper_body_ = std::make_shared<MoveGroupInterface>(mg_node_, upper_body_group_);
 
     configureArmMoveGroup(left_arm_, left_eef_link_, "left");
     configureArmMoveGroup(right_arm_, right_eef_link_, "right");
+    upper_body_->setPlanningTime(planning_time_s_);
+    upper_body_->setNumPlanningAttempts(5);
+    upper_body_->setMaxVelocityScalingFactor(default_speed_scale_);
+    upper_body_->setMaxAccelerationScalingFactor(default_speed_scale_);
 
     double fk_default_width = 0.0;
     if (computeCarryWidth(0.0, fk_default_width)) {
@@ -203,6 +214,44 @@ public:
                 "(joint4=%.4frad)",
                 carry_default_width_m_, carry_min_width_m_, carry_max_width_m_,
                 carry_joint4_rad_);
+  }
+
+  // MoveIt helper node must NOT share the skill_server executor: spin_some(mg_node_)
+  // from a service callback triggers "already been added to an executor" and kills
+  // skill_server, leaving /openarm/gripper unavailable.
+  void startMgExecutor()
+  {
+    if (mg_spin_running_.exchange(true)) {
+      RCLCPP_WARN(get_logger(), "MoveIt helper executor already running");
+      return;
+    }
+    mg_executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+    mg_executor_->add_node(mg_node_);
+    mg_spin_thread_ = std::thread([this]() {
+      if (mg_executor_) {
+        mg_executor_->spin();
+      }
+    });
+    RCLCPP_INFO(get_logger(),
+                "MoveIt helper node '%s' on dedicated executor thread",
+                mg_node_->get_name());
+  }
+
+  void stopMgExecutor()
+  {
+    if (!mg_spin_running_.exchange(false)) {
+      return;
+    }
+    if (mg_executor_) {
+      mg_executor_->cancel();
+    }
+    if (mg_spin_thread_.joinable()) {
+      mg_spin_thread_.join();
+    }
+    if (mg_executor_) {
+      mg_executor_->remove_node(mg_node_);
+      mg_executor_.reset();
+    }
   }
 
   void configureArmMoveGroup(MoveGroupInterfacePtr arm,
@@ -759,6 +808,77 @@ private:
                 arm.c_str(), msg.data[0], msg.data[1]);
   }
 
+  template<typename FutureT>
+  bool waitForFuture(FutureT & future,
+                     std::chrono::milliseconds timeout,
+                     const char * stage)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        return true;
+      }
+      // Action/service callbacks are driven by the MultiThreadedExecutor on
+      // skill_server; do not spin mg_node_ here (crashes if mg_node shares exec).
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const bool ready =
+      future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+    if (!ready) {
+      RCLCPP_ERROR(get_logger(),
+                   "waitForFuture timeout: stage=%s limit_ms=%ld",
+                   stage, static_cast<long>(timeout.count()));
+    }
+    return ready;
+  }
+
+  void drainGripperCancels(
+    const rclcpp_action::Client<GripperCommand>::SharedPtr & left_client,
+    const rclcpp_action::Client<GripperCommand>::SharedPtr & right_client)
+  {
+    if (left_client) {
+      left_client->async_cancel_all_goals();
+    }
+    if (right_client) {
+      right_client->async_cancel_all_goals();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  }
+
+  struct ResolvedGripperCmd
+  {
+    double target_m{0.0};
+    double force{1.0};
+    double speed{0.5};
+    bool compliance_grasp{false};
+  };
+
+  ResolvedGripperCmd resolveGripperRequest(
+    const openarm_skills::srv::Gripper::Request & req) const
+  {
+    ResolvedGripperCmd out;
+    out.force = (std::isfinite(req.force) && req.force > 0.0)
+      ? req.force : 1.0;
+    out.speed = (std::isfinite(req.speed) && req.speed > 0.0)
+      ? req.speed : gripper_default_speed_;
+
+    if (req.position > 0.0) {
+      out.target_m = req.position;
+    } else if (req.action == "close") {
+      out.target_m = gripper_closed_pos_;
+    } else if (req.action == "half_close") {
+      out.target_m = gripper_half_pos_;
+    } else if (req.action == "grasp") {
+      out.target_m = gripper_closed_pos_;
+      out.compliance_grasp = true;
+    } else {
+      out.target_m = gripper_open_pos_;
+    }
+    out.target_m = std::max(gripper_closed_pos_,
+                            std::min(gripper_open_pos_, out.target_m));
+    return out;
+  }
+
   int sendGripperCommand(const std::string & arm,
                          double target_m,
                          double max_effort,
@@ -773,6 +893,8 @@ private:
       return err::ACTION_TIMEOUT;
     }
 
+    drainGripperCancels(client, nullptr);
+
     GripperCommand::Goal goal;
     goal.command.position = target_m;
     goal.command.max_effort = max_effort;
@@ -782,7 +904,8 @@ private:
                 "gripper(%s): target=%.4fm max_effort=%.2f speed=%.2f",
                 arm.c_str(), target_m, max_effort, normalizedGripperSpeed(speed));
     auto goal_future = client->async_send_goal(goal);
-    if (goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+    RCLCPP_DEBUG(get_logger(), "gripper(%s): waiting goal acceptance", arm.c_str());
+    if (!waitForFuture(goal_future, std::chrono::seconds(5), "gripper_goal_accept")) {
       RCLCPP_ERROR(get_logger(), "gripper(%s): timed out waiting for goal acceptance",
                    arm.c_str());
       return err::ACTION_TIMEOUT;
@@ -795,13 +918,17 @@ private:
     }
 
     auto result_future = client->async_get_result(goal_handle);
-    const auto timeout = std::chrono::duration<double>(std::max(1.0, step_timeout_s_));
-    if (result_future.wait_for(timeout) != std::future_status::ready) {
+    const auto timeout_ms = std::chrono::milliseconds(
+      static_cast<int>(std::max(1.0, step_timeout_s_) * 1000.0));
+    RCLCPP_DEBUG(get_logger(), "gripper(%s): waiting action result", arm.c_str());
+    if (!waitForFuture(result_future, timeout_ms, "gripper_result")) {
       RCLCPP_ERROR(get_logger(), "gripper(%s): timed out waiting for result", arm.c_str());
       return err::ACTION_TIMEOUT;
     }
 
     const auto wrapped = result_future.get();
+    RCLCPP_DEBUG(get_logger(), "gripper(%s): action result code=%d",
+                 arm.c_str(), static_cast<int>(wrapped.code));
     if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED && wrapped.result) {
       const bool ok = wrapped.result->reached_goal || wrapped.result->stalled ||
                       (compliance_grasp && isGripped(grip));
@@ -831,8 +958,17 @@ private:
     const double max_effort = normalizedGripperForce(force);
     (void)speed_scale;
     const double speed = normalizedGripperSpeed(gripper_speed);
-    if (max_effort > 0.0 || gripper_speed > 0.0) {
-      return sendGripperCommand(arm, target_m, max_effort, speed, compliance_grasp, grip);
+
+    // Prefer GripperCommand action: MoveIt plan+execute is slow and can starve callbacks.
+    const int rc = sendGripperCommand(arm, target_m, max_effort, speed, compliance_grasp, grip);
+    if (rc == err::OK) {
+      return err::OK;
+    }
+    if (!compliance_grasp) {
+      RCLCPP_ERROR(get_logger(),
+                   "gripper(%s): GripperCommand failed (rc=%d), skipping MoveIt fallback",
+                   arm.c_str(), rc);
+      return rc;
     }
 
     publishGripperAuxCommand(arm, speed, max_effort);
@@ -868,22 +1004,16 @@ private:
     const double max_effort = normalizedGripperForce(force);
     const double speed = normalizedGripperSpeed(gripper_speed);
 
-    if (max_effort <= 0.0 && gripper_speed <= 0.0) {
-      int rc = setGripper(left_grip_, "left", target_m, speed_scale,
-                          compliance_grasp, force, gripper_speed);
-      if (rc != err::OK) return rc;
-      return setGripper(right_grip_, "right", target_m, speed_scale,
-                        compliance_grasp, force, gripper_speed);
-    }
-
     auto left_client = gripperCommandClient("left");
     auto right_client = gripperCommandClient("right");
     if (!left_client || !right_client) return err::BAD_REQUEST;
     if (!left_client->wait_for_action_server(std::chrono::seconds(2)) ||
         !right_client->wait_for_action_server(std::chrono::seconds(2))) {
-      RCLCPP_ERROR(get_logger(), "carry_action: gripper action server unavailable");
+      RCLCPP_ERROR(get_logger(), "gripper(both): action server unavailable");
       return err::ACTION_TIMEOUT;
     }
+
+    drainGripperCancels(left_client, right_client);
 
     publishGripperAuxCommand("left", speed, max_effort);
     publishGripperAuxCommand("right", speed, max_effort);
@@ -896,34 +1026,34 @@ private:
     right_goal.command.max_effort = max_effort;
 
     RCLCPP_INFO(get_logger(),
-                "carry_action: sending synchronized gripper goals "
-                "(target=%.4fm max_effort=%.2f speed=%.2f)",
+                "gripper(both): parallel goals target=%.4fm max_effort=%.2f speed=%.2f",
                 target_m, max_effort, speed);
 
     auto left_goal_future = left_client->async_send_goal(left_goal);
     auto right_goal_future = right_client->async_send_goal(right_goal);
 
-    if (left_goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready ||
-        right_goal_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+    if (!waitForFuture(left_goal_future, std::chrono::seconds(5), "both_left_goal_accept") ||
+        !waitForFuture(right_goal_future, std::chrono::seconds(5), "both_right_goal_accept")) {
       RCLCPP_ERROR(get_logger(),
-                   "carry_action: timed out waiting for gripper goal acceptance");
+                   "gripper(both): timed out waiting for goal acceptance");
       return err::ACTION_TIMEOUT;
     }
 
     auto left_handle = left_goal_future.get();
     auto right_handle = right_goal_future.get();
     if (!left_handle || !right_handle) {
-      RCLCPP_ERROR(get_logger(), "carry_action: gripper goal rejected");
+      RCLCPP_ERROR(get_logger(), "gripper(both): goal rejected");
       return err::EXECUTE_FAILED;
     }
 
     auto left_result_future = left_client->async_get_result(left_handle);
     auto right_result_future = right_client->async_get_result(right_handle);
-    const auto timeout = std::chrono::duration<double>(std::max(1.0, step_timeout_s_));
-    if (left_result_future.wait_for(timeout) != std::future_status::ready ||
-        right_result_future.wait_for(timeout) != std::future_status::ready) {
+    const auto timeout_ms = std::chrono::milliseconds(
+      static_cast<int>(std::max(1.0, step_timeout_s_) * 1000.0));
+    if (!waitForFuture(left_result_future, timeout_ms, "both_left_result") ||
+        !waitForFuture(right_result_future, timeout_ms, "both_right_result")) {
       RCLCPP_ERROR(get_logger(),
-                   "carry_action: timed out waiting for gripper result");
+                   "gripper(both): timed out waiting for result");
       return err::ACTION_TIMEOUT;
     }
 
@@ -1028,6 +1158,32 @@ private:
       return err::EXECUTE_FAILED;
     }
     arm->setStartStateToCurrentState();
+    return err::OK;
+  }
+
+  int moveUpperBodyNamed(const std::string & target_name, double speed_scale)
+  {
+    if (stop_requested_.load()) return err::STOPPED_BY_USER;
+    if (!upper_body_) return err::BAD_REQUEST;
+
+    upper_body_->setMaxVelocityScalingFactor(speed_scale);
+    upper_body_->setMaxAccelerationScalingFactor(speed_scale);
+    upper_body_->setPlanningTime(planning_time_s_);
+    upper_body_->setStartStateToCurrentState();
+    upper_body_->setNamedTarget(target_name);
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    if (upper_body_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(get_logger(), "upper_body(%s): plan failed", target_name.c_str());
+      return err::PLAN_FAILED;
+    }
+    if (upper_body_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(get_logger(), "upper_body(%s): execute failed", target_name.c_str());
+      return err::EXECUTE_FAILED;
+    }
+    upper_body_->setStartStateToCurrentState();
+    if (left_arm_) left_arm_->setStartStateToCurrentState();
+    if (right_arm_) right_arm_->setStartStateToCurrentState();
     return err::OK;
   }
 
@@ -2076,6 +2232,21 @@ private:
                   std::shared_ptr<openarm_skills::srv::GotoHome::Response> resp)
   {
     const double speed = req->speed_scale > 0 ? req->speed_scale : transport_speed_scale_;
+    const std::string pose_name = req->pose_name.empty() ? "home" : req->pose_name;
+
+    if (pose_name == "hands_up") {
+      if (req->arm != "both") {
+        resp->success = false;
+        resp->result_code = err::BAD_REQUEST;
+        resp->message = "hands_up requires arm=both";
+        return;
+      }
+      const int rc = moveUpperBodyNamed("hands_up", speed);
+      resp->result_code = rc;
+      resp->success = (rc == err::OK);
+      resp->message = (rc == err::OK) ? "hands_up pose reached" : "hands_up failed";
+      return;
+    }
 
     using Plan = moveit::planning_interface::MoveGroupInterface::Plan;
 
@@ -2181,40 +2352,49 @@ private:
   void handleGripper(const std::shared_ptr<openarm_skills::srv::Gripper::Request> req,
                      std::shared_ptr<openarm_skills::srv::Gripper::Response> resp)
   {
+    const auto resolved = resolveGripperRequest(*req);
+    RCLCPP_INFO(get_logger(),
+                "handleGripper: arm=%s action=%s req(pos=%.4f f=%.2f s=%.2f) "
+                "-> target=%.4fm force=%.2f speed=%.2f grasp=%d",
+                req->arm.c_str(), req->action.c_str(), req->position, req->force,
+                req->speed, resolved.target_m, resolved.force, resolved.speed,
+                resolved.compliance_grasp);
     // If stop was called but no pick_place is currently active (busy_==false),
     // clear the flag so the standalone gripper command is not rejected.
     if (stop_requested_.load() && !busy_.load()) {
       stop_requested_.store(false);
     }
-    auto g = gripGroup(req->arm);
-    if (!g) {
-      resp->success = false;
-      resp->result_code = err::BAD_REQUEST;
-      resp->message = "arm must be left|right";
-      return;
-    }
-    double target = gripper_open_pos_;
-    bool compliance_grasp = false;
-    if (req->position > 0.0) target = req->position;
-    else if (req->action == "close")       target = gripper_closed_pos_;
-    else if (req->action == "half_close")  target = gripper_half_pos_;
-    else if (req->action == "grasp") {
-      target = gripper_closed_pos_;
-      compliance_grasp = true;
-    } else if (req->action == "open")        target = gripper_open_pos_;
 
-    int rc = setGripper(g, req->arm, target, default_speed_scale_,
-                        compliance_grasp, req->force, req->speed);
+    int rc = err::BAD_REQUEST;
+    if (req->arm == "both") {
+      rc = setBothGrippers(resolved.target_m, default_speed_scale_,
+                           resolved.compliance_grasp,
+                           resolved.force, resolved.speed);
+    } else {
+      auto g = gripGroup(req->arm);
+      if (!g) {
+        resp->success = false;
+        resp->result_code = err::BAD_REQUEST;
+        resp->message = "arm must be left|right|both";
+        return;
+      }
+      rc = setGripper(g, req->arm, resolved.target_m, default_speed_scale_,
+                      resolved.compliance_grasp,
+                      resolved.force, resolved.speed);
+    }
     resp->result_code = rc;
     resp->success = (rc == err::OK);
     resp->message = (rc == err::OK) ? "gripper command done" : "gripper failed";
+    RCLCPP_INFO(get_logger(),
+                "handleGripper done: success=%d rc=%d msg=%s",
+                resp->success, resp->result_code, resp->message.c_str());
   }
 
   // ===========================================================================
   // Members
   // ===========================================================================
   std::string left_arm_group_, right_arm_group_;
-  std::string left_grip_group_, right_grip_group_;
+  std::string left_grip_group_, right_grip_group_, upper_body_group_;
   std::string base_frame_;
   std::string left_eef_link_, right_eef_link_;
   std::string perception_srv_name_;
@@ -2235,8 +2415,12 @@ private:
   double carry_min_width_m_{0.0}, carry_max_width_m_{0.0};
 
   rclcpp::Node::SharedPtr mg_node_;
-  MoveGroupInterfacePtr left_arm_, right_arm_, left_grip_, right_grip_;
+  std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> mg_executor_;
+  std::thread mg_spin_thread_;
+  std::atomic<bool> mg_spin_running_{false};
+  MoveGroupInterfacePtr left_arm_, right_arm_, left_grip_, right_grip_, upper_body_;
   rclcpp::CallbackGroup::SharedPtr traj_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr gripper_srv_cb_group_;
 
   rclcpp_action::Server<PickPlaceAction>::SharedPtr pick_place_server_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr left_arm_traj_client_;
@@ -2270,14 +2454,15 @@ int main(int argc, char ** argv)
 
   auto node = std::make_shared<openarm_skills::SkillServerNode>();
   node->initMoveGroups();
+  node->startMgExecutor();
 
-  // Spin both the skill node and the MGI helper node together, so MoveIt's
-  // internal callbacks (joint_states / scene) keep flowing.
-  rclcpp::executors::MultiThreadedExecutor exec;
+  // skill_server only on this executor; mg_node_ spins on its own thread.
+  rclcpp::executors::MultiThreadedExecutor exec(
+    rclcpp::ExecutorOptions(), 4);
   exec.add_node(node);
-  exec.add_node(node->mgNode());
   exec.spin();
 
+  node->stopMgExecutor();
   rclcpp::shutdown();
   return 0;
 }

@@ -86,6 +86,24 @@ def generate_launch_description():
             default_value="8.0",
             description="Seconds to wait for stack before skill_server starts.",
         ),
+        DeclareLaunchArgument(
+            "openarm_debug",
+            default_value="false",
+            description="Set skill_server log level to debug",
+        ),
+    ]
+
+    skill_log_args = [
+        "--ros-args",
+        "--log-level",
+        PythonExpression([
+            "'skill_server:=debug' if '",
+            LaunchConfiguration("openarm_debug"),
+            "' == 'true' else 'skill_server:=info'",
+        ]),
+        "--log-level", "rcl:=warn",
+        "--log-level", "rmw_fastrtps_cpp:=warn",
+        "--log-level", "rclcpp:=info",
     ]
 
     moveit_config = MoveItConfigsBuilder(
@@ -105,6 +123,7 @@ def generate_launch_description():
         name="skill_server",
         output="screen",
         parameters=skill_params,
+        arguments=skill_log_args,
     )
 
     demo_condition = IfCondition(
@@ -203,6 +222,7 @@ def generate_launch_description():
                 name="skill_server",
                 output="screen",
                 parameters=skill_params,
+                arguments=skill_log_args,
                 condition=stack_only_condition,
             ),
         ]

@@ -1,6 +1,7 @@
-# Drive arm(s) back to the SRDF "home" group state.
+# Drive arm(s) to an SRDF named group state (per-arm "home" or upper_body "hands_up").
 string  arm           # "left" | "right" | "both"
 float64 speed_scale   # 0.0 ~ 1.0 (0 -> server default)
+string  pose_name     # optional: "home" (default) | "hands_up" (requires arm=both)
 ---
 bool   success
 int32  result_code
