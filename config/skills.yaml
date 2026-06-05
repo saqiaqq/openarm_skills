@@ -79,3 +79,13 @@ skill_server:
     carry_joint7_rad: 0.0
     # Default lateral TCP-to-TCP width (m) when only joint4 moves from home.
     carry_default_width_m: 0.307
+
+    # ------------------------------------------------------------------
+    # Hand-water delivery (/openarm/hand_water)
+    # ------------------------------------------------------------------
+    hand_water_speed_scale: 0.10
+    hand_water_approach_offset_m: 0.05
+    hand_water_retreat_offset_m: 0.05
+    hand_water_target_radius_m: 0.04
+    hand_water_gripper_force: 8.0
+    hand_water_gripper_speed: 0.3

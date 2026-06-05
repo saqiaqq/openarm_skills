@@ -10,6 +10,7 @@
 //
 // Exposed interfaces:
 //   Action  : /openarm/pick_place                 [openarm_skills/action/PickPlace]
+//   Action  : /openarm/hand_water                 [openarm_skills/action/HandWater]
 //   Service : /openarm/stop                       [openarm_skills/srv/Stop]
 //   Service : /openarm/goto_home                  [openarm_skills/srv/GotoHome]
 //   Service : /openarm/carry_action               [openarm_skills/srv/CarryAction]
@@ -20,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <future>
 #include <limits>
 #include <memory>
@@ -40,6 +42,7 @@
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 
 #include "openarm_skills/action/pick_place.hpp"
+#include "openarm_skills/action/hand_water.hpp"
 #include "openarm_skills/srv/stop.hpp"
 #include "openarm_skills/srv/goto_home.hpp"
 #include "openarm_skills/srv/carry_action.hpp"
@@ -52,6 +55,10 @@ namespace openarm_skills
 
 using PickPlaceAction = openarm_skills::action::PickPlace;
 using PickPlaceGoalHandle = rclcpp_action::ServerGoalHandle<PickPlaceAction>;
+using HandWaterAction = openarm_skills::action::HandWater;
+using HandWaterGoalHandle = rclcpp_action::ServerGoalHandle<HandWaterAction>;
+using PhaseFb = std::function<void(
+  const std::string &, const std::string &, float, const std::string &)>;
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 using GripperCommand = control_msgs::action::GripperCommand;
 using moveit::planning_interface::MoveGroupInterface;
@@ -123,6 +130,13 @@ public:
     carry_joint7_rad_        = get("carry_joint7_rad", 0.0);
     carry_default_width_m_   = get("carry_default_width_m", 0.307);
 
+    hand_water_speed_scale_       = get("hand_water_speed_scale", 0.10);
+    hand_water_approach_offset_m_ = get("hand_water_approach_offset_m", 0.05);
+    hand_water_retreat_offset_m_  = get("hand_water_retreat_offset_m", 0.05);
+    hand_water_target_radius_m_   = get("hand_water_target_radius_m", 0.04);
+    hand_water_gripper_force_     = get("hand_water_gripper_force", 8.0);
+    hand_water_gripper_speed_     = get("hand_water_gripper_speed", 0.3);
+
     // ---- service clients ---------------------------------------------------
     perception_client_ = this->create_client<openarm_skills::srv::DetectGraspPose>(
       perception_srv_name_);
@@ -175,6 +189,12 @@ public:
       std::bind(&SkillServerNode::handleGoal,   this, _1, _2),
       std::bind(&SkillServerNode::handleCancel, this, _1),
       std::bind(&SkillServerNode::handleAccept, this, _1));
+
+    hand_water_server_ = rclcpp_action::create_server<HandWaterAction>(
+      this, "/openarm/hand_water",
+      std::bind(&SkillServerNode::handleHandWaterGoal,   this, _1, _2),
+      std::bind(&SkillServerNode::handleHandWaterCancel, this, _1),
+      std::bind(&SkillServerNode::handleHandWaterAccept, this, _1));
 
     RCLCPP_INFO(get_logger(), "openarm_skills skill_server ready.");
   }
@@ -1827,7 +1847,7 @@ private:
              double target_radius,
              double gripper_force,
              double gripper_speed,
-             const std::shared_ptr<PickPlaceGoalHandle> & gh)
+             const PhaseFb & publish_fb)
   {
     auto a = armGroup(arm); auto g = gripGroup(arm);
     if (!a || !g) return err::BAD_REQUEST;
@@ -1847,8 +1867,8 @@ private:
     // Open gripper before moving toward the grasp target so approach/descend
     // never push the object with closed fingers.
     if (!isGripperOpen(g)) {
-      publishFb(gh, "grasping", "pick.open_gripper", 0.22,
-                "opening gripper before approach");
+      publish_fb("grasping", "pick.open_gripper", 0.22,
+                 "opening gripper before approach");
       const int og = setGripper(g, arm, gripper_open_pos_, speed,
                                 false, 0.0, gripper_speed);
       if (og) {
@@ -1860,13 +1880,13 @@ private:
                   "pick.open_gripper: gripper already open, skipping");
     }
 
-    publishFb(gh, "grasping", "pick.approach", 0.30, "moving above object");
+    publish_fb("grasping", "pick.approach", 0.30, "moving above object");
     int rc = jointMoveToAvoid(a, offsetZ(grasp, effective_approach),
                               approach_speed, "pick.approach",
                               grasp.position, target_radius);
     if (rc) return rc;
 
-    publishFb(gh, "grasping", "pick.descend", 0.45, "descending to grasp");
+    publish_fb("grasping", "pick.descend", 0.45, "descending to grasp");
     rc = linearMoveTo(a, grasp, speed, "pick.descend");
     if (rc) {
       // Cartesian straight-line descent failed (IK fraction below threshold).
@@ -1883,7 +1903,7 @@ private:
     }
     if (rc) return rc;
 
-    publishFb(gh, "grasping", "pick.close_gripper", 0.55, "grasping object");
+    publish_fb("grasping", "pick.close_gripper", 0.55, "grasping object");
     rc = setGripper(g, arm, gripper_closed_pos_, speed, true,
                     gripper_force, gripper_speed);
     if (rc) return rc;
@@ -1893,8 +1913,8 @@ private:
         RCLCPP_WARN(get_logger(),
                     "pick.close_gripper: gripper closed empty; "
                     "debug_assume_grasp_success=true, continuing to place");
-        publishFb(gh, "grasping", "pick.fake_grasp", 0.60,
-                  "RViz debug: assuming object is held");
+        publish_fb("grasping", "pick.fake_grasp", 0.60,
+                   "RViz debug: assuming object is held");
       } else {
         // Gripper is opened before approach; if retry still triggers the object
         // is likely outside grasp range — lift/open/descend is the recovery.
@@ -1915,7 +1935,7 @@ private:
       }
     }
 
-    publishFb(gh, "grasping", "pick.retreat", 0.65, "lifting object");
+    publish_fb("grasping", "pick.retreat", 0.65, "lifting object");
     rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retreat");
     if (rc) {
       RCLCPP_WARN(get_logger(),
@@ -1933,7 +1953,7 @@ private:
               const geometry_msgs::msg::Pose & place,
               double approach, double retreat, double speed,
               double place_obstacle_radius,
-              const std::shared_ptr<PickPlaceGoalHandle> & gh)
+              const PhaseFb & publish_fb)
   {
     auto a = armGroup(arm); auto g = gripGroup(arm);
     if (!a || !g) return err::BAD_REQUEST;
@@ -1948,12 +1968,12 @@ private:
                 place_obstacle_radius, effective_retreat);
 
     // transport / place.approach: no obstacle sphere (object is held in transit).
-    publishFb(gh, "placing", "place.approach", 0.78, "moving above target");
+    publish_fb("placing", "place.approach", 0.78, "moving above target");
     int rc = jointMoveTo(a, offsetZ(place, approach),
                           approach_speed, "place.approach");
     if (rc) return rc;
 
-    publishFb(gh, "placing", "place.descend", 0.85, "descending to place");
+    publish_fb("placing", "place.descend", 0.85, "descending to place");
     rc = linearMoveTo(a, place, speed, "place.descend");
     if (rc) {
       RCLCPP_WARN(get_logger(),
@@ -1966,12 +1986,12 @@ private:
     }
     if (rc) return rc;
 
-    publishFb(gh, "placing", "place.open_gripper", 0.92, "opening gripper");
+    publish_fb("placing", "place.open_gripper", 0.92, "opening gripper");
     rc = setGripper(g, arm, gripper_open_pos_, speed);
     if (rc) return rc;
 
     // place.retreat: avoid the placed-object sphere (center = place pose).
-    publishFb(gh, "placing", "place.retreat", 0.97, "lifting away from place");
+    publish_fb("placing", "place.retreat", 0.97, "lifting away from place");
     const auto retreat_pose = offsetZ(place, effective_retreat);
     if (place_obstacle_radius > 0.0) {
       rc = jointMoveToAvoid(a, retreat_pose, speed, "place.retreat",
@@ -1995,7 +2015,7 @@ private:
                         const std::vector<double> & start_arm_joints,
                         double start_gripper_target,
                         double speed,
-                        const std::shared_ptr<PickPlaceGoalHandle> & gh)
+                        const PhaseFb & publish_fb)
   {
     auto a = armGroup(arm); auto g = gripGroup(arm);
     if (!a || !g) return err::BAD_REQUEST;
@@ -2004,8 +2024,8 @@ private:
     int rc = err::OK;
 
     if (!start_arm_joints.empty()) {
-      publishFb(gh, "returning", "return.start", 0.985,
-                "returning to start pose");
+      publish_fb("returning", "return.start", 0.985,
+                 "returning to start pose");
       rc = moveArmToJoints(a, start_arm_joints, return_speed, "return.start");
       if (rc == err::OK) {
         last_failure_phase_.clear();
@@ -2019,16 +2039,16 @@ private:
     }
 
     if (start_arm_joints.empty() || rc != err::OK) {
-      publishFb(gh, "returning", "return.home", 0.985,
-                "returning to home pose");
+      publish_fb("returning", "return.home", 0.985,
+                 "returning to home pose");
       rc = moveArmHome(a, return_speed, "return.home");
       if (rc) return rc;
       last_failure_phase_.clear();
       last_failure_reason_.clear();
     }
 
-    publishFb(gh, "returning", "return.restore_gripper", 0.995,
-              "restoring gripper state");
+    publish_fb("returning", "return.restore_gripper", 0.995,
+               "restoring gripper state");
     rc = setGripper(g, arm, start_gripper_target, speed);
     if (rc) {
       last_failure_phase_ = "return.restore_gripper";
@@ -2037,6 +2057,47 @@ private:
     }
 
     return err::OK;
+  }
+
+  // Move to delivery hover point only (place.approach); gripper stays closed.
+  int doHandApproach(const std::string & arm,
+                     const geometry_msgs::msg::Pose & place,
+                     double approach, double speed,
+                     const PhaseFb & publish_fb)
+  {
+    auto a = armGroup(arm);
+    if (!a) return err::BAD_REQUEST;
+
+    const double approach_speed = std::min(speed, transport_speed_scale_);
+    publish_fb("placing", "place.approach", 0.90, "holding at delivery hover point");
+    return jointMoveTo(a, offsetZ(place, approach),
+                       approach_speed, "place.approach");
+  }
+
+  static geometry_msgs::msg::Pose makeHandWaterGraspPose(const std::string & arm)
+  {
+    geometry_msgs::msg::Pose p;
+    p.position.x = -0.25;
+    p.position.z = 0.28;
+    p.orientation.x = -0.7071;
+    p.orientation.y = 0.0;
+    p.orientation.z = 0.7071;
+    p.orientation.w = 0.0;
+    p.position.y = (arm == "left") ? 0.08 : -0.08;
+    return p;
+  }
+
+  static geometry_msgs::msg::Pose makeHandWaterPlacePose(const std::string & arm)
+  {
+    geometry_msgs::msg::Pose p;
+    p.position.x = 0.48;
+    p.position.z = 0.6;
+    p.orientation.x = 0.7071;
+    p.orientation.y = 0.0;
+    p.orientation.z = 0.7071;
+    p.orientation.w = 0.0;
+    p.position.y = (arm == "left") ? 0.18 : -0.18;
+    return p;
   }
 
   // ===========================================================================
@@ -2144,7 +2205,14 @@ private:
                 speed, approach, retreat, target_radius,
                 gripper_force, gripper_speed);
 
-    publishFb(gh, "perceiving", "pick.detect", 0.05, "resolving grasp pose");
+    PhaseFb publish_fb = [this, gh](const std::string & status,
+                                    const std::string & phase,
+                                    float progress,
+                                    const std::string & msg) {
+      publishFb(gh, status, phase, progress, msg);
+    };
+
+    publish_fb("perceiving", "pick.detect", 0.05, "resolving grasp pose");
     if (goal->pose_source == "camera") {
       int rc = callPerception("grasp", goal->target_name, goal->target_index, grasp);
       if (rc) return finish(gh, result, rc, "grasp perception failed");
@@ -2154,10 +2222,10 @@ private:
     }
 
     int rc = doPick(goal->arm, grasp, approach, retreat, speed, target_radius,
-                    gripper_force, gripper_speed, gh);
+                    gripper_force, gripper_speed, publish_fb);
     if (rc) return finish(gh, result, rc, "pick failed");
 
-    publishFb(gh, "transporting", "transport", 0.72, "moving to place region");
+    publish_fb("transporting", "transport", 0.72, "moving to place region");
     if (goal->pose_source == "camera") {
       int prc = callPerception("place", goal->target_name, goal->target_index, place);
       if (prc) return finish(gh, result, prc, "place perception failed");
@@ -2168,13 +2236,148 @@ private:
 
     // transport + place.approach/descend: no sphere avoidance.
     // place.retreat uses target_radius around place_pose (released object).
-    rc = doPlace(goal->arm, place, approach, retreat, speed, target_radius, gh);
+    rc = doPlace(goal->arm, place, approach, retreat, speed, target_radius, publish_fb);
     if (rc) return finish(gh, result, rc, "place failed");
 
-    rc = doPostPlaceReturn(goal->arm, start_arm_joints, start_gripper_target, speed, gh);
+    rc = doPostPlaceReturn(goal->arm, start_arm_joints, start_gripper_target, speed,
+                           publish_fb);
     if (rc) return finish(gh, result, rc, "post-place return failed");
 
     return finish(gh, result, err::OK, "pick_and_place done");
+  }
+
+  rclcpp_action::GoalResponse handleHandWaterGoal(
+    const rclcpp_action::GoalUUID &,
+    std::shared_ptr<const HandWaterAction::Goal> g)
+  {
+    if (g->arm != "left" && g->arm != "right") {
+      RCLCPP_ERROR(get_logger(), "hand_water reject: arm must be 'left' or 'right'");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    if (busy_.exchange(true)) {
+      RCLCPP_WARN(get_logger(), "hand_water reject: already busy with another goal");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+  }
+
+  rclcpp_action::CancelResponse handleHandWaterCancel(
+    const std::shared_ptr<HandWaterGoalHandle>)
+  {
+    stop_requested_.store(true);
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  void handleHandWaterAccept(const std::shared_ptr<HandWaterGoalHandle> gh)
+  {
+    std::thread([this, gh]() { executeHandWater(gh); }).detach();
+  }
+
+  void publishHandWaterFb(const std::shared_ptr<HandWaterGoalHandle> & gh,
+                          const std::string & status,
+                          const std::string & phase,
+                          float progress,
+                          const std::string & msg)
+  {
+    auto fb = std::make_shared<HandWaterAction::Feedback>();
+    fb->status = status;
+    fb->phase  = phase;
+    fb->progress = progress;
+    fb->message = msg;
+    gh->publish_feedback(fb);
+  }
+
+  void executeHandWater(const std::shared_ptr<HandWaterGoalHandle> gh)
+  {
+    auto goal = gh->get_goal();
+    auto result = std::make_shared<HandWaterAction::Result>();
+
+    stop_requested_.store(false);
+    last_failure_phase_.clear();
+    last_failure_reason_.clear();
+
+    const double speed = goal->speed_scale > 0 ? goal->speed_scale
+                                               : hand_water_speed_scale_;
+    const double approach = hand_water_approach_offset_m_;
+    const double retreat  = hand_water_retreat_offset_m_;
+    const double target_radius = hand_water_target_radius_m_;
+    const double gripper_force = normalizedGripperForce(
+      goal->gripper_force > 0 ? goal->gripper_force : hand_water_gripper_force_);
+    const double gripper_speed = normalizedGripperSpeed(
+      goal->gripper_speed > 0 ? goal->gripper_speed : hand_water_gripper_speed_);
+    geometry_msgs::msg::Pose grasp = makeHandWaterGraspPose(goal->arm);
+    geometry_msgs::msg::Pose place = makeHandWaterPlacePose(goal->arm);
+    normalizeQuat(grasp, "hand_water.grasp_pose", get_logger());
+    normalizeQuat(place, "hand_water.place_pose", get_logger());
+
+    RCLCPP_INFO(get_logger(),
+                "hand_water: arm=%s grasp=[%.3f,%.3f,%.3f] place=[%.3f,%.3f,%.3f] "
+                "speed=%.3f retreat=%.3f",
+                goal->arm.c_str(),
+                grasp.position.x, grasp.position.y, grasp.position.z,
+                place.position.x, place.position.y, place.position.z,
+                speed, retreat);
+
+    PhaseFb publish_fb = [this, gh](const std::string & status,
+                                    const std::string & phase,
+                                    float progress,
+                                    const std::string & msg) {
+      publishHandWaterFb(gh, status, phase, progress, msg);
+    };
+
+    if (!inWorkspace(grasp)) {
+      return finishHandWater(gh, result, err::BAD_REQUEST,
+                             "hand_water grasp_pose outside workspace");
+    }
+    if (!inWorkspace(place)) {
+      return finishHandWater(gh, result, err::BAD_REQUEST,
+                             "hand_water place_pose outside workspace");
+    }
+
+    publish_fb("perceiving", "pick.detect", 0.05, "using fixed behind-grasp pose");
+
+    int rc = doPick(goal->arm, grasp, approach, retreat, speed, target_radius,
+                    gripper_force, gripper_speed, publish_fb);
+    if (rc) return finishHandWater(gh, result, rc, "hand_water pick failed");
+
+    publish_fb("transporting", "transport", 0.72, "moving to delivery region");
+
+    rc = doHandApproach(goal->arm, place, approach, speed, publish_fb);
+    if (rc) return finishHandWater(gh, result, rc, "hand_water approach failed");
+
+    return finishHandWater(gh, result, err::OK, "hand_water done at place.approach");
+  }
+
+  void finishHandWater(const std::shared_ptr<HandWaterGoalHandle> & gh,
+                       std::shared_ptr<HandWaterAction::Result> result,
+                       int code, const std::string & msg)
+  {
+    result->result_code = code;
+    std::string full = msg;
+    if (code != err::OK && !last_failure_phase_.empty()) {
+      full += " at " + last_failure_phase_;
+      if (!last_failure_reason_.empty()) {
+        full += ": " + last_failure_reason_;
+      }
+    }
+    result->message = full;
+    if (code == err::OK) {
+      result->success = true;
+      result->status = "done";
+      gh->succeed(result);
+    } else if (code == err::STOPPED_BY_USER) {
+      result->success = false;
+      result->status = "stopped";
+      gh->canceled(result);
+    } else {
+      result->success = false;
+      result->status = "error";
+      gh->abort(result);
+    }
+    last_failure_phase_.clear();
+    last_failure_reason_.clear();
+    busy_.store(false);
+    stop_requested_.store(false);
   }
 
   void finish(const std::shared_ptr<PickPlaceGoalHandle> & gh,
@@ -2413,6 +2616,12 @@ private:
   double carry_joint4_rad_, carry_joint6_rad_, carry_joint7_rad_;
   double carry_default_width_m_;
   double carry_min_width_m_{0.0}, carry_max_width_m_{0.0};
+  double hand_water_speed_scale_;
+  double hand_water_approach_offset_m_;
+  double hand_water_retreat_offset_m_;
+  double hand_water_target_radius_m_;
+  double hand_water_gripper_force_;
+  double hand_water_gripper_speed_;
 
   rclcpp::Node::SharedPtr mg_node_;
   std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> mg_executor_;
@@ -2423,6 +2632,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr gripper_srv_cb_group_;
 
   rclcpp_action::Server<PickPlaceAction>::SharedPtr pick_place_server_;
+  rclcpp_action::Server<HandWaterAction>::SharedPtr hand_water_server_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr left_arm_traj_client_;
   rclcpp_action::Client<FollowJointTrajectory>::SharedPtr right_arm_traj_client_;
   rclcpp_action::Client<GripperCommand>::SharedPtr left_gripper_cmd_client_;

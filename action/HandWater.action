@@ -1,0 +1,25 @@
+# HandWater.action
+# Goal: pick from behind, transport to front hover (place.approach), then stop.
+# Gripper stays closed; arm holds position (no descend / release / return home).
+# Grasp/place poses are fixed on the server for left/right arms.
+#
+# Goal --------------------------------------------------------------
+string  cmd_id
+string  arm                 # "left" | "right"
+float64 speed_scale         # Velocity scaling (0.0 ~ 1.0); 0 = server default
+float64 wait_timeout_s      # Deprecated/unused (kept for API compatibility)
+float64 gripper_force       # Gripper force during grasp; 0 = controller default
+float64 gripper_speed       # Gripper speed during grasp; 0 = default
+float64 timeout_s           # 0 = use server default
+---
+# Result ------------------------------------------------------------
+bool    success
+int32   result_code         # See openarm_api/schemas/error_codes.json
+string  status              # "done" | "error" | "stopped"
+string  message
+---
+# Feedback ----------------------------------------------------------
+string  status              # perceiving|grasping|transporting|placing|handing|returning|done|error|stopped
+string  phase               # e.g. "pick.approach", "place.descend", "hand.wait"
+float32 progress            # 0.0 ~ 1.0
+string  message
