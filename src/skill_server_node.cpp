@@ -668,16 +668,15 @@ private:
     std::vector<geometry_msgs::msg::Pose> waypoints{target};
     moveit_msgs::msg::RobotTrajectory traj;
 
-    int attempts = plan_retry_count_ + 1;
+    // Cartesian path planning is mostly deterministic for a given start state.
+    // Retrying multiple times just wastes time. We try exactly once.
+    int attempts = 1;
     double fraction = 0.0;
     while (attempts-- > 0 && !stop_requested_.load()) {
       arm->setStartStateToCurrentState();
       fraction = arm->computeCartesianPath(
         waypoints, cartesian_eef_step_, cartesian_jump_thresh_, traj);
       if (fraction >= cartesian_min_fraction_) break;
-      RCLCPP_WARN(get_logger(),
-                  "[%s] cartesian plan fraction=%.2f (jump_thresh=%.1f), retrying...",
-                  phase.c_str(), fraction, cartesian_jump_thresh_);
     }
     if (fraction < cartesian_min_fraction_) {
       RCLCPP_WARN(get_logger(),
@@ -792,7 +791,14 @@ private:
     for (const auto & [pipeline, planner] : kPipelines) {
       arm->setPlanningPipelineId(pipeline);
       arm->setPlannerId(planner);
-      int attempts = plan_retry_count_ + 1;
+      // PTP is deterministic; if it fails, giving it lots of time/retries is useless.
+      if (planner == "PTP") {
+        arm->setPlanningTime(1.5);
+      } else {
+        arm->setPlanningTime(planning_time_s_);
+      }
+      int attempts = (planner == "PTP") ? 1 : (plan_retry_count_ + 1);
+      
       while (attempts-- > 0 && !stop_requested_.load()) {
         arm->setStartStateToCurrentState();
         if (arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
@@ -1173,7 +1179,13 @@ private:
     for (const auto & [pipeline, planner] : kPipelines) {
       arm->setPlanningPipelineId(pipeline);
       arm->setPlannerId(planner);
-      int attempts = plan_retry_count_ + 1;
+      if (planner == "PTP") {
+        arm->setPlanningTime(1.5);
+      } else {
+        arm->setPlanningTime(planning_time_s_);
+      }
+      int attempts = (planner == "PTP") ? 1 : (plan_retry_count_ + 1);
+      
       while (attempts-- > 0 && !stop_requested_.load()) {
         arm->setStartStateToCurrentState();
         if (arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
