@@ -956,10 +956,17 @@ private:
     goal.command.max_effort = max_effort;
     // Always publish aux command to set speed and force
     publishGripperAuxCommand(arm, speed, max_effort);
+    
+    // If the goal is to open the gripper, we don't want to wait for the action
+    // result. The motor's PID controller takes time to stabilize, and the action
+    // server might wait several seconds to report SUCCESS. By returning early,
+    // the system proceeds immediately to the next phase without a 5s delay.
+    bool return_early_on_open = (target_m >= gripper_open_pos_ * 0.9);
 
     RCLCPP_INFO(get_logger(),
-                "gripper(%s): target=%.4fm max_effort=%.2f speed=%.2f",
-                arm.c_str(), target_m, max_effort, normalizedGripperSpeed(speed));
+                "gripper(%s): target=%.4fm max_effort=%.2f speed=%.2f%s",
+                arm.c_str(), target_m, max_effort, normalizedGripperSpeed(speed),
+                return_early_on_open ? " (fast-return)" : "");
     auto goal_future = client->async_send_goal(goal);
     RCLCPP_DEBUG(get_logger(), "gripper(%s): waiting goal acceptance", arm.c_str());
     if (!waitForFuture(goal_future, std::chrono::seconds(5), "gripper_goal_accept")) {
@@ -972,6 +979,14 @@ private:
     if (!goal_handle) {
       RCLCPP_ERROR(get_logger(), "gripper(%s): goal rejected", arm.c_str());
       return err::EXECUTE_FAILED;
+    }
+    
+    if (return_early_on_open) {
+      // Small sleep to ensure the command reaches the controller before we
+      // return and potentially start moving the arm.
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      publishGripperAuxCommand(arm, speed, 0.0);
+      return err::OK;
     }
 
     auto result_future = client->async_get_result(goal_handle);
@@ -992,8 +1007,6 @@ private:
     if (compliance_grasp && isGripped(grip)) {
       // Small hold force to prevent overheating and dropping
       publishGripperAuxCommand(arm, speed, std::max(2.0, max_effort * 0.2));
-    } else if (target_m >= gripper_open_pos_ * 0.9) {
-      publishGripperAuxCommand(arm, speed, 0.0);
     }
                  
     if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED && wrapped.result) {
