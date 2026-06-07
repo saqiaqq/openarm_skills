@@ -15,6 +15,7 @@ find_package(rclcpp_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(shape_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 find_package(moveit_msgs REQUIRED)
@@ -59,6 +60,7 @@ ament_target_dependencies(skill_server_node
   std_msgs
   std_srvs
   geometry_msgs
+  shape_msgs
   sensor_msgs
   moveit_ros_planning_interface
   moveit_msgs

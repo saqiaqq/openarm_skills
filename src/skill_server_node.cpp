@@ -36,8 +36,12 @@
 #include <control_msgs/action/gripper_command.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit/robot_state/robot_state.h>
+#include <moveit_msgs/msg/attached_collision_object.hpp>
+#include <moveit_msgs/msg/collision_object.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <shape_msgs/msg/solid_primitive.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 
@@ -108,6 +112,12 @@ public:
     plan_retry_count_       = get("plan_retry_count",  2);
     grasp_retry_count_      = get("grasp_retry_count", 1);
     debug_assume_grasp_success_ = get("debug_assume_grasp_success", false);
+    const bool openarm_debug = get("openarm_debug", false);
+    if (openarm_debug) {
+      debug_assume_grasp_success_ = true;
+      RCLCPP_INFO(get_logger(),
+                  "openarm_debug=true → debug_assume_grasp_success enabled");
+    }
 
     gripper_open_pos_       = get("gripper_open_pos",   0.040);
     gripper_half_pos_       = get("gripper_half_pos",   0.020);
@@ -133,8 +143,12 @@ public:
     hand_water_speed_scale_       = get("hand_water_speed_scale", 0.10);
     hand_water_approach_offset_m_ = get("hand_water_approach_offset_m", 0.05);
     hand_water_retreat_offset_m_  = get("hand_water_retreat_offset_m", 0.05);
-    hand_water_target_radius_m_   = get("hand_water_target_radius_m", 0.04);
-    hand_water_gripper_force_     = get("hand_water_gripper_force", 8.0);
+    hand_water_target_radius_m_   = get("hand_water_target_radius_m", 0.06);
+    hand_water_pick_sphere_m_     = get("hand_water_pick_sphere_m", 0.04);
+    hand_water_gripper_open_m_    = get("hand_water_gripper_open_m", 0.040);
+    hand_water_bottle_attach_offset_m_ =
+      get("hand_water_bottle_attach_offset_m", 0.10);
+    hand_water_gripper_force_     = get("hand_water_gripper_force", 12.0);
     hand_water_gripper_speed_     = get("hand_water_gripper_speed", 0.3);
 
     // ---- service clients ---------------------------------------------------
@@ -201,11 +215,14 @@ public:
 
   // MoveGroupInterface needs a *separate* node; lazily build them so we can
   // construct the SkillServerNode first and call rclcpp::spin() on it.
-  void initMoveGroups()
+  void createMgNode()
   {
     auto opts = rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true);
     mg_node_ = rclcpp::Node::make_shared("skill_server_mgi", opts);
+  }
 
+  void initMoveGroups()
+  {
     left_arm_   = std::make_shared<MoveGroupInterface>(mg_node_, left_arm_group_);
     right_arm_  = std::make_shared<MoveGroupInterface>(mg_node_, right_arm_group_);
     left_grip_  = std::make_shared<MoveGroupInterface>(mg_node_, left_grip_group_);
@@ -249,6 +266,8 @@ public:
     mg_executor_->add_node(mg_node_);
     mg_spin_thread_ = std::thread([this]() {
       if (mg_executor_) {
+        // Prevent SingleThreadedExecutor from hanging when called
+        // from another thread.
         mg_executor_->spin();
       }
     });
@@ -537,7 +556,7 @@ private:
       double margin) const
   {
     geometry_msgs::msg::Pose via = to;
-    via.orientation = from.orientation;
+    via.orientation = to.orientation;
     const double shell = radius + margin;
     via.position.x = 0.5 * (from.position.x + to.position.x);
     via.position.y = 0.5 * (from.position.y + to.position.y);
@@ -643,6 +662,7 @@ private:
     int attempts = plan_retry_count_ + 1;
     double fraction = 0.0;
     while (attempts-- > 0 && !stop_requested_.load()) {
+      arm->setStartStateToCurrentState();
       fraction = arm->computeCartesianPath(
         waypoints, cartesian_eef_step_, cartesian_jump_thresh_, traj);
       if (fraction >= cartesian_min_fraction_) break;
@@ -765,6 +785,7 @@ private:
       arm->setPlannerId(planner);
       int attempts = plan_retry_count_ + 1;
       while (attempts-- > 0 && !stop_requested_.load()) {
+        arm->setStartStateToCurrentState();
         if (arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
           logIkResult(plan, phase, planner);
           if (arm->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
@@ -918,6 +939,7 @@ private:
     GripperCommand::Goal goal;
     goal.command.position = target_m;
     goal.command.max_effort = max_effort;
+    // Always publish aux command to set speed and force
     publishGripperAuxCommand(arm, speed, max_effort);
 
     RCLCPP_INFO(get_logger(),
@@ -949,6 +971,16 @@ private:
     const auto wrapped = result_future.get();
     RCLCPP_DEBUG(get_logger(), "gripper(%s): action result code=%d",
                  arm.c_str(), static_cast<int>(wrapped.code));
+                 
+    // Publish a hold force if grasping, or 0 force if opening, so we don't
+    // overheat the motor when holding the object.
+    if (compliance_grasp && isGripped(grip)) {
+      // Small hold force to prevent overheating and dropping
+      publishGripperAuxCommand(arm, speed, std::max(2.0, max_effort * 0.2));
+    } else if (target_m >= gripper_open_pos_ * 0.9) {
+      publishGripperAuxCommand(arm, speed, 0.0);
+    }
+                 
     if (wrapped.code == rclcpp_action::ResultCode::SUCCEEDED && wrapped.result) {
       const bool ok = wrapped.result->reached_goal || wrapped.result->stalled ||
                       (compliance_grasp && isGripped(grip));
@@ -1021,6 +1053,7 @@ private:
                       double gripper_speed = 0.0)
   {
     if (stop_requested_.load()) return err::STOPPED_BY_USER;
+    (void)speed_scale;
     const double max_effort = normalizedGripperForce(force);
     const double speed = normalizedGripperSpeed(gripper_speed);
 
@@ -1133,6 +1166,7 @@ private:
       arm->setPlannerId(planner);
       int attempts = plan_retry_count_ + 1;
       while (attempts-- > 0 && !stop_requested_.load()) {
+        arm->setStartStateToCurrentState();
         if (arm->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
           logIkResult(plan, phase, planner);
           if (arm->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
@@ -1838,6 +1872,117 @@ private:
     return err::OK;
   }
 
+  static std::string carriedBottleId(const std::string & arm)
+  {
+    return arm + "_hand_water_bottle";
+  }
+
+  static void bottleTouchLinks(const std::string & arm,
+                               const std::string & eef_link,
+                               std::vector<std::string> & out)
+  {
+    out = {eef_link};
+    if (arm == "left") {
+      out.push_back("openarm_left_hand");
+      out.push_back("openarm_left_left_finger");
+      out.push_back("openarm_left_right_finger");
+      // Forearm links may contact the attached bottle during behind→front transport,
+      // especially with the larger transport collision sphere (target_radius=0.06).
+      out.push_back("openarm_left_link7");
+      out.push_back("openarm_left_link6");
+      out.push_back("openarm_left_link5");
+    } else {
+      out.push_back("openarm_right_hand");
+      out.push_back("openarm_right_left_finger");
+      out.push_back("openarm_right_right_finger");
+      out.push_back("openarm_right_link7");
+      out.push_back("openarm_right_link6");
+      out.push_back("openarm_right_link5");
+    }
+  }
+
+  bool attachCarriedBottle(const std::string & arm, double planning_radius_m)
+  {
+    const std::string eef = (arm == "left") ? left_eef_link_ : right_eef_link_;
+    moveit_msgs::msg::AttachedCollisionObject aco;
+    aco.link_name = eef;
+    aco.object.id = carriedBottleId(arm);
+    aco.object.header.frame_id = eef;
+    aco.object.operation = moveit_msgs::msg::CollisionObject::ADD;
+
+    shape_msgs::msg::SolidPrimitive sphere;
+    sphere.type = shape_msgs::msg::SolidPrimitive::SPHERE;
+    sphere.dimensions = {std::max(0.02, planning_radius_m)};
+
+    geometry_msgs::msg::Pose rel;
+    rel.orientation.w = 1.0;
+    rel.position.z = -hand_water_bottle_attach_offset_m_;
+
+    aco.object.primitives.push_back(sphere);
+    aco.object.primitive_poses.push_back(rel);
+    bottleTouchLinks(arm, eef, aco.touch_links);
+
+    if (!planning_scene_interface_.applyAttachedCollisionObject(aco)) {
+      RCLCPP_WARN(get_logger(),
+                  "hand_water: failed to attach bottle collision model on %s",
+                  eef.c_str());
+      return false;
+    }
+    carried_bottle_arm_ = arm;
+    RCLCPP_INFO(get_logger(),
+                "hand_water: attached bottle sphere r=%.3fm offset_z=%.3fm on %s",
+                sphere.dimensions[0], hand_water_bottle_attach_offset_m_,
+                eef.c_str());
+    return true;
+  }
+
+  // Detach + purge the bottle from the planning scene.  MoveIt leaves a
+  // world-frame ghost (type 'Object') after REMOVE on an attached body; that
+  // ghost blocks the next pick.approach when the arm is still near place.
+  void removeBottleCollisionObject(const std::string & arm)
+  {
+    const std::string id = carriedBottleId(arm);
+    const std::string eef = (arm == "left") ? left_eef_link_ : right_eef_link_;
+
+    moveit_msgs::msg::AttachedCollisionObject aco;
+    aco.link_name = eef;
+    aco.object.id = id;
+    aco.object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+    planning_scene_interface_.applyAttachedCollisionObject(aco);
+
+    planning_scene_interface_.removeCollisionObjects({id});
+  }
+
+  void clearStaleHandWaterBottles()
+  {
+    removeBottleCollisionObject("left");
+    removeBottleCollisionObject("right");
+    carried_bottle_arm_.clear();
+  }
+
+  void detachCarriedBottle()
+  {
+    if (carried_bottle_arm_.empty()) return;
+    const std::string arm = carried_bottle_arm_;
+    const std::string eef = (arm == "left") ? left_eef_link_ : right_eef_link_;
+    removeBottleCollisionObject(arm);
+    RCLCPP_INFO(get_logger(), "hand_water: removed bottle collision model from %s",
+                eef.c_str());
+    carried_bottle_arm_.clear();
+  }
+
+  bool isGripperOpenTo(MoveGroupInterfacePtr grip, double open_target_m,
+                       double tolerance_m = 0.005) const
+  {
+    auto cur = grip->getCurrentJointValues();
+    if (cur.empty()) return false;
+    const double thresh = open_target_m - tolerance_m;
+    for (auto v : cur) {
+      if (v < thresh) return false;
+    }
+    return true;
+  }
+
   // ===========================================================================
   // Pick / Place primitives
   // ===========================================================================
@@ -1847,29 +1992,46 @@ private:
              double target_radius,
              double gripper_force,
              double gripper_speed,
-             const PhaseFb & publish_fb)
+             const PhaseFb & publish_fb,
+             bool allow_fake_grasp = true,
+             double gripper_open_override = 0.0,
+             bool inflate_hover_with_target_radius = true,
+             double pick_obstacle_radius = -1.0)
   {
     auto a = armGroup(arm); auto g = gripGroup(arm);
     if (!a || !g) return err::BAD_REQUEST;
+
+    const double open_target = gripper_open_override > 0.0
+      ? gripper_open_override : gripper_open_pos_;
 
     // Approach uses the user's speed_scale capped at transport_speed_scale_ so
     // that a very slow speed_scale (e.g. 0.01) is visible, while a very high
     // one does not exceed the configured transport limit.
     const double approach_speed = std::min(speed, transport_speed_scale_);
-    const double effective_approach =
-      effectiveApproachOffset(approach, target_radius);
+    // hand_water keeps transport target_radius off the hover height but still
+    // needs pick_obstacle_radius (pick_sphere) so hover clears the shell.
+    const double effective_approach = inflate_hover_with_target_radius
+      ? effectiveApproachOffset(approach, target_radius)
+      : (pick_obstacle_radius > 0.0
+          ? effectiveApproachOffset(approach, pick_obstacle_radius)
+          : approach);
+    const double obstacle_radius = pick_obstacle_radius > 0.0
+      ? pick_obstacle_radius : target_radius;
     RCLCPP_INFO(get_logger(),
                 "pick: speed_scale=%.3f  approach_speed=%.3f  transport_limit=%.3f "
-                "target_radius=%.3f gripper_force=%.1f",
+                "target_radius=%.3f obstacle_radius=%.3f hover=%.3f "
+                "gripper_force=%.1f open=%.3f fake_grasp=%d",
                 speed, approach_speed, transport_speed_scale_,
-                target_radius, gripper_force);
+                target_radius, obstacle_radius, effective_approach,
+                gripper_force, open_target,
+                allow_fake_grasp ? 1 : 0);
 
     // Open gripper before moving toward the grasp target so approach/descend
     // never push the object with closed fingers.
-    if (!isGripperOpen(g)) {
+    if (!isGripperOpenTo(g, open_target)) {
       publish_fb("grasping", "pick.open_gripper", 0.22,
                  "opening gripper before approach");
-      const int og = setGripper(g, arm, gripper_open_pos_, speed,
+      const int og = setGripper(g, arm, open_target, speed,
                                 false, 0.0, gripper_speed);
       if (og) {
         RCLCPP_WARN(get_logger(),
@@ -1883,7 +2045,7 @@ private:
     publish_fb("grasping", "pick.approach", 0.30, "moving above object");
     int rc = jointMoveToAvoid(a, offsetZ(grasp, effective_approach),
                               approach_speed, "pick.approach",
-                              grasp.position, target_radius);
+                              grasp.position, obstacle_radius);
     if (rc) return rc;
 
     publish_fb("grasping", "pick.descend", 0.45, "descending to grasp");
@@ -1909,7 +2071,7 @@ private:
     if (rc) return rc;
 
     if (!isGripped(g)) {
-      if (debug_assume_grasp_success_) {
+      if (allow_fake_grasp && debug_assume_grasp_success_) {
         RCLCPP_WARN(get_logger(),
                     "pick.close_gripper: gripper closed empty; "
                     "debug_assume_grasp_success=true, continuing to place");
@@ -1923,15 +2085,31 @@ private:
                     "lift→open→descend×%d", grasp_retry_count_);
         for (int i = 0; i < grasp_retry_count_ && !isGripped(g); ++i) {
           rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift");
-          if (rc) jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift.jnt");
-          setGripper(g, arm, gripper_open_pos_, speed,
+          if (rc) {
+            rc = jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retry_lift.jnt");
+            if (!rc) {
+              last_failure_phase_.clear();
+              last_failure_reason_.clear();
+            }
+          }
+          setGripper(g, arm, open_target, speed,
                      false, 0.0, gripper_speed);
           rc = linearMoveTo(a, grasp, speed, "pick.retry_descend");
-          if (rc) jointMoveTo(a, grasp, speed, "pick.retry_descend.jnt");
+          if (rc) {
+            rc = jointMoveTo(a, grasp, speed, "pick.retry_descend.jnt");
+            if (!rc) {
+              last_failure_phase_.clear();
+              last_failure_reason_.clear();
+            }
+          }
           setGripper(g, arm, gripper_closed_pos_, speed, true,
                      gripper_force, gripper_speed);
         }
-        if (!isGripped(g)) return err::GRIP_NOT_HELD;
+        if (!isGripped(g)) {
+          last_failure_phase_ = "pick.close_gripper";
+          last_failure_reason_ = "gripper closed empty after retries";
+          return err::GRIP_NOT_HELD;
+        }
       }
     }
 
@@ -2083,7 +2261,8 @@ private:
     p.orientation.y = 0.0;
     p.orientation.z = 0.7071;
     p.orientation.w = 0.0;
-    p.position.y = (arm == "left") ? 0.08 : -0.08;
+    // Increase Y offset to avoid shoulder/wrist singularity when reaching behind
+    p.position.y = (arm == "left") ? 0.15 : -0.15;
     return p;
   }
 
@@ -2295,6 +2474,7 @@ private:
     stop_requested_.store(false);
     last_failure_phase_.clear();
     last_failure_reason_.clear();
+    clearStaleHandWaterBottles();
 
     const double speed = goal->speed_scale > 0 ? goal->speed_scale
                                                : hand_water_speed_scale_;
@@ -2312,11 +2492,13 @@ private:
 
     RCLCPP_INFO(get_logger(),
                 "hand_water: arm=%s grasp=[%.3f,%.3f,%.3f] place=[%.3f,%.3f,%.3f] "
-                "speed=%.3f retreat=%.3f",
+                "speed=%.3f retreat=%.3f target_radius=%.3f pick_sphere=%.3f "
+                "open=%.3f force=%.1f",
                 goal->arm.c_str(),
                 grasp.position.x, grasp.position.y, grasp.position.z,
                 place.position.x, place.position.y, place.position.z,
-                speed, retreat);
+                speed, retreat, target_radius, hand_water_pick_sphere_m_,
+                hand_water_gripper_open_m_, gripper_force);
 
     PhaseFb publish_fb = [this, gh](const std::string & status,
                                     const std::string & phase,
@@ -2337,10 +2519,15 @@ private:
     publish_fb("perceiving", "pick.detect", 0.05, "using fixed behind-grasp pose");
 
     int rc = doPick(goal->arm, grasp, approach, retreat, speed, target_radius,
-                    gripper_force, gripper_speed, publish_fb);
+                    gripper_force, gripper_speed, publish_fb,
+                    true, hand_water_gripper_open_m_,
+                    false, hand_water_pick_sphere_m_);
     if (rc) return finishHandWater(gh, result, rc, "hand_water pick failed");
 
-    publish_fb("transporting", "transport", 0.72, "moving to delivery region");
+    attachCarriedBottle(goal->arm, target_radius);
+
+    publish_fb("transporting", "transport", 0.72,
+                 "moving to delivery region (bottle collision attached)");
 
     rc = doHandApproach(goal->arm, place, approach, speed, publish_fb);
     if (rc) return finishHandWater(gh, result, rc, "hand_water approach failed");
@@ -2352,6 +2539,7 @@ private:
                        std::shared_ptr<HandWaterAction::Result> result,
                        int code, const std::string & msg)
   {
+    detachCarriedBottle();
     result->result_code = code;
     std::string full = msg;
     if (code != err::OK && !last_failure_phase_.empty()) {
@@ -2620,8 +2808,13 @@ private:
   double hand_water_approach_offset_m_;
   double hand_water_retreat_offset_m_;
   double hand_water_target_radius_m_;
+  double hand_water_pick_sphere_m_;
+  double hand_water_gripper_open_m_;
+  double hand_water_bottle_attach_offset_m_;
   double hand_water_gripper_force_;
   double hand_water_gripper_speed_;
+  std::string carried_bottle_arm_;
+  moveit::planning_interface::PlanningSceneInterface planning_scene_interface_;
 
   rclcpp::Node::SharedPtr mg_node_;
   std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> mg_executor_;
@@ -2663,8 +2856,9 @@ int main(int argc, char ** argv)
   rclcpp::init(argc, argv);
 
   auto node = std::make_shared<openarm_skills::SkillServerNode>();
-  node->initMoveGroups();
+  node->createMgNode();
   node->startMgExecutor();
+  node->initMoveGroups();
 
   // skill_server only on this executor; mg_node_ spins on its own thread.
   rclcpp::executors::MultiThreadedExecutor exec(

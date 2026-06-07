@@ -28,6 +28,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 from moveit_configs_utils import MoveItConfigsBuilder
 
@@ -115,6 +116,16 @@ def generate_launch_description():
         moveit_config.robot_description_semantic,
         moveit_config.robot_description_kinematics,
         cfg,
+        {
+            "openarm_debug": ParameterValue(
+                PythonExpression([
+                    "'",
+                    LaunchConfiguration("openarm_debug"),
+                    "' == 'true'",
+                ]),
+                value_type=bool,
+            ),
+        },
     ]
 
     skill_server_node = Node(

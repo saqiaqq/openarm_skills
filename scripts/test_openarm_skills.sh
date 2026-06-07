@@ -254,15 +254,16 @@ PICK_PLACE_NOTES
 案例（左臂递水，位姿已在 skill_server 内写死，与案例1e相同路径）：
 ros2 action send_goal /openarm/hand_water openarm_skills/action/HandWater \
   "{cmd_id: 'test-hw-left', arm: 'left', speed_scale: 0.10,
-    gripper_force: 8.0, gripper_speed: 0.3, timeout_s: 120.0}" --feedback
+    gripper_force: 12.0, gripper_speed: 0.3, timeout_s: 120.0}" --feedback
 
 案例（右臂递水，与案例1f相同路径）：
 ros2 action send_goal /openarm/hand_water openarm_skills/action/HandWater \
   "{cmd_id: 'test-hw-right', arm: 'right', speed_scale: 0.10,
-    gripper_force: 8.0, gripper_speed: 0.3, timeout_s: 120.0}" --feedback
+    gripper_force: 12.0, gripper_speed: 0.3, timeout_s: 120.0}" --feedback
 
 与 pick_place 的区别：
-  - pick.retreat 标准抬起 0.05m（与案例 1e 相同）
+  - target_radius=0.06（transport 附着碰撞球）；pick.approach 用 pick_sphere=0.04 避障，hover 固定 0.05m
+  - pick.retreat 标准抬起 0.05m；openarm_debug:=true 时自动启用 debug_assume_grasp_success（仿真可过）
   - 执行到 place.approach 悬停点后结束；不执行 place.descend / 松爪 / return.home
   - 夹爪保持闭合，手臂停在递送悬停位，后续由上层另行控制松爪或回位
 
@@ -277,7 +278,7 @@ echo ""
 echo ">>> hand_water (left arm — fixed behind-to-front poses)"
 ros2 action send_goal /openarm/hand_water openarm_skills/action/HandWater \
   "{cmd_id: 'test-hw-left', arm: 'left', speed_scale: 0.10,
-    gripper_force: 8.0, gripper_speed: 0.3, timeout_s: 120.0}" --feedback
+    gripper_force: 12.0, gripper_speed: 0.3, timeout_s: 120.0}" --feedback
 
 echo ""
 echo ">>> pick_place (right arm, upper_computer poses — edit script if needed)"
