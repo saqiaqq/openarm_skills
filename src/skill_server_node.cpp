@@ -218,6 +218,15 @@ public:
   void createMgNode()
   {
     auto opts = rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true);
+    opts.use_global_arguments(false);
+    
+    std::vector<rclcpp::Parameter> params;
+    const auto & overrides = this->get_node_parameters_interface()->get_parameter_overrides();
+    for (const auto & kv : overrides) {
+      params.emplace_back(kv.first, kv.second);
+    }
+    opts.parameter_overrides(params);
+    
     mg_node_ = rclcpp::Node::make_shared("skill_server_mgi", opts);
   }
 
@@ -2114,11 +2123,16 @@ private:
     }
 
     publish_fb("grasping", "pick.retreat", 0.65, "lifting object");
-    rc = linearMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retreat");
+    const double effective_retreat = inflate_hover_with_target_radius
+      ? effectiveApproachOffset(retreat, target_radius)
+      : (pick_obstacle_radius > 0.0
+          ? effectiveApproachOffset(retreat, pick_obstacle_radius)
+          : retreat);
+    rc = linearMoveTo(a, offsetZ(grasp, effective_retreat), speed, "pick.retreat");
     if (rc) {
       RCLCPP_WARN(get_logger(),
                   "pick.retreat cartesian failed, falling back to joint-space");
-      rc = jointMoveTo(a, offsetZ(grasp, retreat), speed, "pick.retreat.jnt");
+      rc = jointMoveTo(a, offsetZ(grasp, effective_retreat), speed, "pick.retreat.jnt");
       if (!rc) {
         last_failure_phase_.clear();
         last_failure_reason_.clear();
