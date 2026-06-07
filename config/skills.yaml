@@ -85,7 +85,7 @@ skill_server:
     # ------------------------------------------------------------------
     hand_water_speed_scale: 0.10
     hand_water_approach_offset_m: 0.05
-    hand_water_retreat_offset_m: 0.05
+    hand_water_retreat_offset_m: 0.13
     hand_water_target_radius_m: 0.06
     # pick.approach 避障球：与身后固定抓取点匹配，勿随运输碰撞半径放大
     hand_water_pick_sphere_m: 0.04
